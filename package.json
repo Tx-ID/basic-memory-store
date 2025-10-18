@@ -1,0 +1,26 @@
+{
+    "type": "module",
+    "devDependencies": {
+        "@swc/core": "^1.13.5",
+        "@swc/helpers": "^0.5.17",
+        "@types/express": "^5.0.3",
+        "@types/node": "^24.8.1",
+        "nodemon": "^3.1.10",
+        "pkgroll": "^2.20.0",
+        "regenerator-runtime": "^0.14.1",
+        "tslib": "^2.8.1",
+        "tsx": "^4.20.6"
+    },
+    "scripts": {
+        "build": "pkgroll",
+        "start": "node ./dist/index.mjs",
+        "dev": "nodemon --exec tsx src"
+    },
+    "dependencies": {
+        "dotenv": "^17.2.3",
+        "express": "^5.1.0",
+        "http-status-codes": "^2.3.0",
+        "zod": "^4.1.12"
+    },
+    "exports": "./dist/index.mjs"
+}
