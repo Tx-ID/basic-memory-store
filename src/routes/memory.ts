@@ -28,7 +28,7 @@ type Body = z.infer<typeof Body>;
 async function set(req: Request, res: Response, next: NextFunction) {
     try {
         const index = String(req.params.index!);
-        const server = get_index_cache(index);
+        const game = get_index_cache(index);
 
         const key = String(req.params.id!);
 
@@ -38,7 +38,7 @@ async function set(req: Request, res: Response, next: NextFunction) {
         }
 
         const body = safe_body.data;
-        server.set(key, body.data, body.ttl);
+        game.set(key, body.data, body.ttl);
         res.status(StatusCodes.OK).send({message: ReasonPhrases.OK});
 
     } catch (error) {
@@ -47,17 +47,32 @@ async function set(req: Request, res: Response, next: NextFunction) {
 }
 router.post("/:index/:id", set);
 
+async function get(req: Request, res: Response, next: NextFunction) {
+    try {
+        const index = String(req.params.index!);
+        const key = String(req.params.id!);
+
+        const game = get_index_cache(index);
+        const server = game.get(key);
+        res.status(StatusCodes.OK).send({message: ReasonPhrases.OK, data: server});
+
+    } catch (error) {
+        next(error);
+    }
+}
+router.get("/:index/:id", get);
+
 async function getAll(req: Request, res: Response, next: NextFunction) {
     try {
         const index = String(req.params.index!);
-        const server = get_index_cache(index);
+        const game = get_index_cache(index);
 
         const list = [];
-        for (const key of server.map().keys()) {
-            if (server.has(key)) {
+        for (const key of game.map().keys()) {
+            if (game.has(key)) {
                 list.push({
                     key,
-                    data: server.get(key),
+                    data: game.get(key),
                 });
             }
         }
