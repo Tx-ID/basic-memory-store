@@ -47,6 +47,22 @@ async function set(req: Request, res: Response, next: NextFunction) {
 }
 router.post("/:index/:id", set);
 
+async function del(req: Request, res: Response, next: NextFunction) {
+    try {
+        const index = String(req.params.index!);
+        const game = get_index_cache(index);
+
+        const key = String(req.params.id!);
+
+        game.delete(key);
+        res.status(StatusCodes.OK).send({message: ReasonPhrases.OK});
+
+    } catch (error) {
+        next(error);
+    }
+}
+router.delete("/:index/:id", del);
+
 async function get(req: Request, res: Response, next: NextFunction) {
     try {
         const index = String(req.params.index!);
