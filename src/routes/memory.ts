@@ -9,24 +9,25 @@ import { TTLCache } from "../utils/cache";
 
 //
 const router = Router();
-const cache = new TTLCache<string, TTLCache<string, any>>();
+const cache = new TTLCache<string, TTLCache<string, {payload: any, cursor: number}>>();
 
 function get_index_cache(idx: string) {
-    const object = cache.get(idx) ?? new TTLCache<string, any>();
-    cache.set(idx, object, 0);
+    let object = cache.get(idx);
+    if (!object) {
+        object = new TTLCache();
+        cache.set(idx, object, 0);
+    }
     return object;
 }
 
 
 const Query = z.object({
-    page: z.preprocess(
-        (a) => parseInt(z.string().parse(a), 10),
-        z.number().positive().default(1)
-    ),
-    pageSize: z.preprocess(
-        (a) => parseInt(z.string().parse(a), 10),
-        z.number().positive().default(10)
-    ),
+    pageSize: z.coerce.number()
+        .int()
+        .positive()
+        .max(5000)
+        .default(5000),
+    cursor: z.coerce.number().optional(),
 });
 
 //
@@ -49,7 +50,14 @@ async function set(req: Request, res: Response, next: NextFunction) {
         }
 
         const body = safe_body.data;
-        game.set(key, body.data, body.ttl);
+
+        const cursor = Date.now(); 
+        const cacheEntry = {
+            payload: body.data,
+            cursor: cursor
+        };
+
+        game.set(key, cacheEntry, body.ttl);
         res.status(StatusCodes.OK).send({message: ReasonPhrases.OK});
 
     } catch (error) {
@@ -81,7 +89,7 @@ async function get(req: Request, res: Response, next: NextFunction) {
 
         const game = get_index_cache(index);
         const server = game.get(key);
-        res.status(StatusCodes.OK).send({message: ReasonPhrases.OK, data: server});
+        res.status(StatusCodes.OK).send({message: ReasonPhrases.OK, data: server?.payload});
 
     } catch (error) {
         next(error);
@@ -98,52 +106,48 @@ async function getAll(req: Request, res: Response, next: NextFunction) {
         if (!safe_query.success) {
             return res.status(StatusCodes.BAD_REQUEST).send({error: ReasonPhrases.BAD_REQUEST, error_data: safe_query.error.issues})
         }
-        const { page, pageSize } = safe_query.data;
+        const { cursor, pageSize } = safe_query.data;
 
-        const allItems = [];
+        const allEntries = [];
         for (const key of game.map().keys()) {
-            if (game.has(key)) {
-                allItems.push({
-                    key,
-                    data: game.get(key),
+            const entry = game.get(key);
+            if (entry) {
+                allEntries.push({
+                    key: key,
+                    data: entry.payload,
+                    cursor: entry.cursor,
                 });
             }
         }
 
-        const totalItems = allItems.length;
+        let sortedItems = allEntries.sort((a, b) => b.cursor - a.cursor);
+        const totalItems = sortedItems.length;
 
-        if (totalItems === 0) {
-            return res.status(StatusCodes.OK).send({
-                message: "No data found",
-                data: [],
-                page: 1,
-                pageSize,
-                maxPages: 0,
-                totalItems: 0,
-            });
+        if (cursor) {
+            sortedItems = sortedItems.filter(item => item.cursor < cursor);
         }
 
-        const maxPages = Math.ceil(totalItems / pageSize);
+        const rawPageItems = sortedItems.slice(0, pageSize);
 
-        let safePage = page;
-        if (safePage > maxPages) {
-            safePage = maxPages;
-        }
-        if (safePage < 1) {
-            safePage = 1;
-        }
+        const lastItem = rawPageItems[rawPageItems.length - 1];
+        const nextCursor = lastItem ? lastItem.cursor : null;
 
-        const startIndex = (safePage - 1) * pageSize;
-        const endIndex = safePage * pageSize;
-        const paginatedItems = allItems.slice(startIndex, endIndex);
+        const paginatedItems = rawPageItems.map(item => ({
+            key: item.key,
+            data: item.data
+        }));
+
+        const hasMore = paginatedItems.length === pageSize && sortedItems.length > pageSize;
 
         res.status(StatusCodes.OK).send({
             message: ReasonPhrases.OK,
             data: paginatedItems,
-            page: safePage,
-            pageSize,
-            maxPages,
-            totalItems,
+            meta: {
+                pageSize,
+                totalItems,
+                nextCursor, 
+                hasMore,
+            },
         });
 
     } catch (error) {
