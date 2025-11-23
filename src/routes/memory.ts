@@ -18,6 +18,17 @@ function get_index_cache(idx: string) {
 }
 
 
+const Query = z.object({
+    page: z.preprocess(
+        (a) => parseInt(z.string().parse(a), 10),
+        z.number().positive().default(1)
+    ),
+    pageSize: z.preprocess(
+        (a) => parseInt(z.string().parse(a), 10),
+        z.number().positive().default(10)
+    ),
+});
+
 //
 const Body = z.object({
     ttl: z.int().default(2 * 60),
@@ -83,16 +94,57 @@ async function getAll(req: Request, res: Response, next: NextFunction) {
         const index = String(req.params.index!);
         const game = get_index_cache(index);
 
-        const list = [];
+        const safe_query = Query.safeParse(req.query);
+        if (!safe_query.success) {
+            return res.status(StatusCodes.BAD_REQUEST).send({error: ReasonPhrases.BAD_REQUEST, error_data: safe_query.error.issues})
+        }
+        const { page, pageSize } = safe_query.data;
+
+        const allItems = [];
         for (const key of game.map().keys()) {
             if (game.has(key)) {
-                list.push({
+                allItems.push({
                     key,
                     data: game.get(key),
                 });
             }
         }
-        res.status(StatusCodes.OK).send({message: ReasonPhrases.OK, data: list});
+
+        const totalItems = allItems.length;
+
+        if (totalItems === 0) {
+            return res.status(StatusCodes.OK).send({
+                message: "No data found",
+                data: [],
+                page: 1,
+                pageSize,
+                maxPages: 0,
+                totalItems: 0,
+            });
+        }
+
+        const maxPages = Math.ceil(totalItems / pageSize);
+
+        let safePage = page;
+        if (safePage > maxPages) {
+            safePage = maxPages;
+        }
+        if (safePage < 1) {
+            safePage = 1;
+        }
+
+        const startIndex = (safePage - 1) * pageSize;
+        const endIndex = safePage * pageSize;
+        const paginatedItems = allItems.slice(startIndex, endIndex);
+
+        res.status(StatusCodes.OK).send({
+            message: ReasonPhrases.OK,
+            data: paginatedItems,
+            page: safePage,
+            pageSize,
+            maxPages,
+            totalItems,
+        });
 
     } catch (error) {
         next(error);
