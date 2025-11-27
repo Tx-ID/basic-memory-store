@@ -8,6 +8,7 @@ interface Config {
     port: number;
     nodeEnv: string;
     keys: string[];
+    MONGO_CONNECTION_URL: string,
 }
 
 //
@@ -20,6 +21,7 @@ const config: Config = {
     port: Number(process.env.PORT) || 3000,
     nodeEnv: process.env.NODE_ENV || "development",
     keys,
+    MONGO_CONNECTION_URL: process.env.MONGO_CONNECTION_URL ?? "",
 };
 
 export default config;
