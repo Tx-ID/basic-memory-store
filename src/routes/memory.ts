@@ -71,6 +71,15 @@ const Query = z.object({
     useDb: z.coerce.boolean().default(false), // Toggle DB Read
 });
 
+const SortedQuery = z.object({
+    pageSize: z.coerce.number().int().positive().max(5000).default(5000),
+    cursor: z.string().optional(),
+    sortDirection: z.enum(["asc", "desc"]).default("desc"),
+    dataName: z.string(),
+    useDb: z.coerce.boolean().default(false),
+    defaultValue: z.string().optional(),
+});
+
 const Body = z.object({
     ttl: z.number().int().default(2 * 60),
     data: z.any(),
@@ -78,6 +87,20 @@ const Body = z.object({
 });
 
 const isDbReady = () => mongoose.connection.readyState === 1;
+
+// Helper to handle mixed type comparison
+function compare(a: any, b: any, dir: "asc" | "desc") {
+    if (a === b) return 0;
+    if (dir === "asc") return a > b ? 1 : -1;
+    return a < b ? 1 : -1;
+}
+
+// Helper to parse cursor/value
+function parseValue(val: string | undefined): string | number | undefined {
+    if (val === undefined) return undefined;
+    const num = Number(val);
+    return isNaN(num) ? val : num;
+}
 
 
 // --- Routes ---
@@ -147,6 +170,264 @@ async function del(req: Request, res: Response, next: NextFunction) {
     }
 }
 router.delete("/:index/:id", del);
+
+async function getSorted(req: Request, res: Response, next: NextFunction) {
+    try {
+        const index = String(req.params.index!);
+        const safe = SortedQuery.safeParse(req.query);
+        if (!safe.success) {
+            return res.status(StatusCodes.BAD_REQUEST).send({
+                error: ReasonPhrases.BAD_REQUEST,
+                error_data: safe.error.issues,
+            });
+        }
+
+        const { pageSize, cursor, sortDirection, dataName, useDb, defaultValue } = safe.data;
+        const parsedCursor = parseValue(cursor);
+        const parsedDefaultValue = parseValue(defaultValue);
+
+        let paginatedItems: any[] = [];
+        let nextCursor: string | number | null = null;
+        let hasMore = false;
+        let totalItems = 0;
+
+        if (useDb) {
+            if (!isDbReady()) {
+                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({ 
+                    error: ReasonPhrases.SERVICE_UNAVAILABLE, 
+                    message: "Database not connected" 
+                });
+            }
+
+            const sortOrder = sortDirection === "asc" ? 1 : -1;
+            const filterOp = sortDirection === "asc" ? "$gt" : "$lt";
+
+            if (parsedDefaultValue !== undefined) {
+                // Use Aggregation to handle default value
+                const pipeline: any[] = [
+                    { $match: { index } },
+                    {
+                        $addFields: {
+                            sortVal: { $ifNull: [`$payload.${dataName}`, parsedDefaultValue] }
+                        }
+                    }
+                ];
+
+                if (parsedCursor !== undefined) {
+                    pipeline.push({ $match: { sortVal: { [filterOp]: parsedCursor } } });
+                }
+
+                pipeline.push({ $sort: { sortVal: sortOrder } });
+                pipeline.push({ $limit: pageSize });
+
+                const docs = await CacheModel.aggregate(pipeline).exec();
+
+                // For total items, we technically should count everything in index
+                totalItems = await CacheModel.countDocuments({ index });
+
+                paginatedItems = docs.map((d) => ({ key: d.key, data: d.payload }));
+
+                if (docs.length > 0) {
+                    const last = docs[docs.length - 1];
+                    nextCursor = last.sortVal;
+
+                    // Check hasMore
+                    const checkPipeline: any[] = [
+                        { $match: { index } },
+                        {
+                            $addFields: {
+                                sortVal: { $ifNull: [`$payload.${dataName}`, parsedDefaultValue] }
+                            }
+                        },
+                        { $match: { sortVal: { [filterOp]: nextCursor } } },
+                        { $limit: 1 },
+                        { $project: { _id: 1 } }
+                    ];
+                    const rem = await CacheModel.aggregate(checkPipeline).exec();
+                    hasMore = rem.length > 0;
+                }
+
+            } else {
+                // Standard Find
+                const q: any = { index };
+                if (parsedCursor !== undefined) {
+                    q[`payload.${dataName}`] = { [filterOp]: parsedCursor };
+                }
+                // Filter out missing fields if no default value provided
+                q[`payload.${dataName}`] = { $exists: true, ...q[`payload.${dataName}`] };
+
+                const docs = await CacheModel.find(q)
+                    .sort({ [`payload.${dataName}`]: sortOrder })
+                    .limit(pageSize)
+                    .lean();
+
+                totalItems = await CacheModel.countDocuments({ index, [`payload.${dataName}`]: { $exists: true } });
+
+                paginatedItems = docs.map((d) => ({ key: d.key, data: d.payload }));
+
+                if (docs.length > 0) {
+                    const last = docs[docs.length - 1]!;
+                    nextCursor = last.payload[dataName];
+                    
+                    const checkQ = { ...q };
+                    if (nextCursor !== undefined) {
+                        checkQ[`payload.${dataName}`] = { [filterOp]: nextCursor, $exists: true };
+                    }
+                    const rem = await CacheModel.findOne(checkQ).select("_id");
+                    hasMore = !!rem;
+                }
+            }
+        } else {
+            const game = get_index_cache(index);
+            const allEntries = [];
+
+            for (const key of game.map().keys()) {
+                const entry = game.get(key);
+                if (entry && entry.payload) {
+                    const val = entry.payload[dataName] ?? parsedDefaultValue;
+                    if (val !== undefined) {
+                         allEntries.push({
+                            key,
+                            data: entry.payload,
+                            val: val,
+                        });
+                    }
+                }
+            }
+
+            allEntries.sort((a, b) => compare(a.val, b.val, sortDirection));
+            totalItems = allEntries.length;
+
+            let filtered = allEntries;
+            if (parsedCursor !== undefined) {
+                filtered = allEntries.filter(i => {
+                    if (sortDirection === "asc") return i.val > parsedCursor;
+                    return i.val < parsedCursor;
+                });
+            }
+
+            const page = filtered.slice(0, pageSize);
+            paginatedItems = page.map((i) => ({ key: i.key, data: i.data }));
+
+            const last = page[page.length - 1];
+            nextCursor = last ? last.val : null;
+            hasMore = page.length === pageSize && filtered.length > pageSize;
+        }
+
+        res.status(StatusCodes.OK).send({
+            message: ReasonPhrases.OK,
+            data: paginatedItems,
+            meta: {
+                pageSize,
+                totalItems,
+                nextCursor,
+                hasMore,
+                source: useDb ? "db" : "memory",
+            },
+        });
+    } catch (error) {
+        next(error);
+    }
+}
+router.get("/:index/sorted", getSorted);
+
+async function getRank(req: Request, res: Response, next: NextFunction) {
+    try {
+        const index = String(req.params.index!);
+        const key = String(req.params.id!);
+        
+        const safe = SortedQuery.safeParse(req.query);
+        if (!safe.success) {
+            return res.status(StatusCodes.BAD_REQUEST).send({
+                error: ReasonPhrases.BAD_REQUEST,
+                error_data: safe.error.issues,
+            });
+        }
+        const { sortDirection, dataName, useDb, defaultValue } = safe.data;
+        const parsedDefaultValue = parseValue(defaultValue);
+
+        let rank = 0;
+
+        if (useDb) {
+            if (!isDbReady()) {
+                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({ 
+                    error: ReasonPhrases.SERVICE_UNAVAILABLE, 
+                    message: "Database not connected" 
+                });
+            }
+
+            const doc = await CacheModel.findOne({ index, key }).lean();
+            if (!doc) {
+                return res.status(StatusCodes.NOT_FOUND).send({ error: ReasonPhrases.NOT_FOUND });
+            }
+
+            const targetVal = doc.payload[dataName] ?? parsedDefaultValue;
+            if (targetVal === undefined) {
+                return res.status(StatusCodes.BAD_REQUEST).send({ error: "Field not found in data and no default provided" });
+            }
+
+            const filterOp = sortDirection === "asc" ? "$lt" : "$gt";
+            
+            if (parsedDefaultValue !== undefined) {
+                const pipeline = [
+                    { $match: { index } },
+                    {
+                        $addFields: {
+                            sortVal: { $ifNull: [`$payload.${dataName}`, parsedDefaultValue] }
+                        }
+                    },
+                    { $match: { sortVal: { [filterOp]: targetVal } } },
+                    { $count: "count" }
+                ];
+                const result = await CacheModel.aggregate(pipeline).exec();
+                rank = (result[0]?.count || 0) + 1;
+            } else {
+                const count = await CacheModel.countDocuments({
+                    index,
+                    [`payload.${dataName}`]: { [filterOp]: targetVal, $exists: true }
+                });
+                rank = count + 1;
+            }
+
+        } else {
+            const game = get_index_cache(index);
+            const entry = game.get(key);
+            if (!entry) {
+                return res.status(StatusCodes.NOT_FOUND).send({ error: ReasonPhrases.NOT_FOUND });
+            }
+
+            const targetVal = entry.payload[dataName] ?? parsedDefaultValue;
+            if (targetVal === undefined) {
+                return res.status(StatusCodes.BAD_REQUEST).send({ error: "Field not found in data and no default provided" });
+            }
+
+            let betterCount = 0;
+            for (const k of game.map().keys()) {
+                const item = game.get(k);
+                if (item && item.payload) {
+                    const val = item.payload[dataName] ?? parsedDefaultValue;
+                    if (val !== undefined) {
+                        if (sortDirection === "asc") {
+                            if (val < targetVal) betterCount++;
+                        } else {
+                            if (val > targetVal) betterCount++;
+                        }
+                    }
+                }
+            }
+            rank = betterCount + 1;
+        }
+
+        res.status(StatusCodes.OK).send({
+            message: ReasonPhrases.OK,
+            data: { rank },
+        });
+
+    } catch (error) {
+        next(error);
+    }
+}
+router.get("/:index/rank/:id", getRank);
 
 async function get(req: Request, res: Response, next: NextFunction) {
     try {
