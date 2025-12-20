@@ -2,34 +2,11 @@ import { Router } from "express";
 import type { NextFunction, Request, Response } from "express";
 import { ReasonPhrases, StatusCodes } from "http-status-codes";
 import * as z from "zod";
-import mongoose, { Schema } from "mongoose";
-import type { Document } from "mongoose";
+import mongoose from "mongoose";
 
 import config from "../config/config";
 import { TTLCache } from "../utils/cache";
-
-// --- Mongoose Schema & Model ---
-interface ICacheDoc extends Document {
-    index: string;
-    key: string;
-    payload: any;
-    cursor: number;
-    expireAt: Date;
-}
-
-const CacheSchema = new Schema<ICacheDoc>({
-    index: { type: String, required: true, index: true },
-    key: { type: String, required: true, index: true },
-    payload: { type: Schema.Types.Mixed, required: true },
-    cursor: { type: Number, required: true, index: true },
-    expireAt: { type: Date, required: true },
-});
-
-CacheSchema.index({ index: 1, key: 1 }, { unique: true });
-CacheSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 }); // MongoDB auto-removes expired docs
-
-const CacheModel = mongoose.model<ICacheDoc>("DynamicCache", CacheSchema);
-
+import { CacheModel } from "../models/MemoryCache";
 
 // --- In-Memory Cache Setup ---
 const router = Router();
