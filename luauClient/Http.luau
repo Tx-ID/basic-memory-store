@@ -1,4 +1,5 @@
 local HttpService = game:GetService("HttpService")
+local RequestQueue = require(script.Parent:WaitForChild("RequestQueue"))
 local DEBUG = false
 
 --
@@ -90,7 +91,9 @@ function http.request(v: string | HttpConfig, request_config: HttpConfig?): Http
 		print(payload)
 	end
 
-	local response = HttpService:RequestAsync(payload)
+	local response = RequestQueue.enqueue(function()
+		return HttpService:RequestAsync(payload)
+	end)
 
 	if response.Body then
 		local is_json, json = pcall(function()
