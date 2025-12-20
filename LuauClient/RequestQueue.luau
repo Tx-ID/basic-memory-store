@@ -8,11 +8,29 @@ local processing = false
 local REQUESTS_PER_MINUTE = 500 -- Safe margin below Roblox's 500/min limit
 local DELAY_BETWEEN_REQUESTS = 60 / REQUESTS_PER_MINUTE
 
-function RequestQueue.enqueue(requestFunction)
+function RequestQueue.enqueue(requestFunction, deduplicationKey: string?)
 	local tcs = Instance.new("BindableEvent")
+	
+	-- If a deduplication key is provided, remove any pending requests with the same key
+	if deduplicationKey then
+		for i = #queue, 1, -1 do
+			if queue[i].deduplicationKey == deduplicationKey then
+				local removed = table.remove(queue, i)
+				task.spawn(function()
+					removed.callback({
+						Success = true, -- Treat as success but skipped
+						StatusCode = 200,
+						StatusMessage = "Request superseded",
+						Body = nil
+					})
+				end)
+			end
+		end
+	end
 	
 	table.insert(queue, {
 		fn = requestFunction,
+		deduplicationKey = deduplicationKey,
 		callback = function(...)
 			tcs:Fire(...)
 		end

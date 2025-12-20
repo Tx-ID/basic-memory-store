@@ -11,6 +11,7 @@ type HttpConfig = {
 	headers: { [string]: any }?,
 	data: ({ [string]: any } | string)?,
 	params: { [string]: any }?,
+	deduplicationKey: string?,
 }
 
 export type HttpResult = {
@@ -93,7 +94,7 @@ function http.request(v: string | HttpConfig, request_config: HttpConfig?): Http
 
 	local response = RequestQueue.enqueue(function()
 		return HttpService:RequestAsync(payload)
-	end)
+	end, config.deduplicationKey)
 
 	if response.Body then
 		local is_json, json = pcall(function()

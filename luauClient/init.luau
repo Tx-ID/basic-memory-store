@@ -7,7 +7,7 @@ _ = ConfigService.getConfig() or ConfigService.ConfigAdded:Wait()
 local Snapshot = ConfigService.getConfig()
 local ConfigData: { key: string? } = Snapshot and Snapshot:GetValue("tixmemory") or {}
 
-local BASE_URL = ""
+local BASE_URL = ConfigData.url or ""
 local AUTHORIZATION_KEY = `Bearer {ConfigData.key or ""}`
 local DEFAULT_EXPIRATION = 60 * 5
 
@@ -115,6 +115,7 @@ function HttpHashMap.SetAsync(self: TixHashMap, key: string, value: ValidValue, 
 			data = value,
 			persist = self.UseDb,
 		},
+		deduplicationKey = self:_getPath(key),
 	})
 	if not http_response.Success then
 		error(`Failed to post HttpMemoryStore: {http_response.StatusCode}`)
@@ -136,7 +137,7 @@ function HttpHashMap.GetAsync(self: TixHashMap, key: string)
 		end
 		error(`Failed to get HttpMemoryStore: {http_response.StatusCode}`)
 	end
-	return http_response.Body
+	return http_response.Body.data
 end
 
 function HttpHashMap.AllItemsAsync(self: TixHashMap)
@@ -330,6 +331,7 @@ function HttpHashMap.RemoveAsync(self: TixHashMap, key: string)
 			["content-type"] = "application/json",
 		},
 		params = self:_getParams(),
+		deduplicationKey = self:_getPath(key),
 	})
 	if not http_response.Success then
 		error(`Failed to remove HttpMemoryStore: {http_response.StatusCode}`)

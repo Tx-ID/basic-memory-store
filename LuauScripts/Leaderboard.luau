@@ -5,6 +5,20 @@ local MemoryStoreClient = require(script.Parent.Parent:WaitForChild("luauClient"
 
 local DEFAULT_EXPIRATION = "90d"
 
+export type LeaderboardEntry = {
+	UserId: number,
+	Username: string,
+	DisplayName: string,
+	Score: number,
+}
+
+export type RankResponse = {
+	Rank: number?,
+	Data: LeaderboardEntry?,
+}
+
+type TixList = MemoryStoreClient.TixList
+
 export type Leaderboard = typeof(setmetatable({}, Leaderboard))
 
 function Leaderboard.new(boardId: string, useDb: boolean?)
@@ -54,7 +68,7 @@ function Leaderboard.IncrementScore(self: Leaderboard, player: Player, amount: n
 end
 
 -- Gets the player's Rank and their Data
-function Leaderboard.GetRank(self: Leaderboard, player: Player)
+function Leaderboard.GetRank(self: Leaderboard, player: Player): RankResponse
 	local key = tostring(player.UserId)
 
 	-- GetRankAsync(key, dataName, sortDirection, defaultValue)
@@ -71,7 +85,7 @@ function Leaderboard.GetRank(self: Leaderboard, player: Player)
 end
 
 -- Returns a PagingObject for iterating through the top players
-function Leaderboard.GetTop(self: Leaderboard, pageSize: number?)
+function Leaderboard.GetTop(self: Leaderboard, pageSize: number?): TixList
 	-- GetSortedAsync(dataName, sortDirection, sizePerPage, defaultValue)
 	return self._store:GetSortedAsync(self._sortField, "desc", pageSize or 50, 0)
 end
