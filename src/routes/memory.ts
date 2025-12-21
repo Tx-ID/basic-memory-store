@@ -31,10 +31,10 @@ setInterval(() => {
     for (const idx of cache.map().keys()) {
         const game = cache.get(idx);
         if (game) {
-            // If TTLCache requires manual pruning, call it here.
-            // Otherwise, accessing keys or iteration usually triggers lazy checks.
-            for (const key of game.map().keys()) {
-                game.get(key); // Access to trigger lazy expiry if applicable
+            // size() will iterate all keys and trigger lazy expiry for them
+            if (game.size() === 0) {
+                // If the index cache is empty, remove it to prevent memory leaks
+                cache.delete(idx);
             }
         }
     }
@@ -263,25 +263,33 @@ async function getSorted(req: Request, res: Response, next: NextFunction) {
                 if (entry && entry.payload) {
                     const val = entry.payload[dataName] ?? parsedDefaultValue;
                     if (val !== undefined) {
-                         allEntries.push({
-                            key,
-                            data: entry.payload,
-                            val: val,
-                        });
+                        totalItems++;
+                        
+                        let include = true;
+                        if (parsedCursor !== undefined) {
+                             if (sortDirection === "asc") {
+                                 if (val <= parsedCursor) include = false;
+                             } else {
+                                 if (val >= parsedCursor) include = false;
+                             }
+                        }
+
+                        if (include) {
+                            allEntries.push({
+                                key,
+                                data: entry.payload,
+                                val: val,
+                            });
+                        }
                     }
                 }
             }
 
             allEntries.sort((a, b) => compare(a.val, b.val, sortDirection));
-            totalItems = allEntries.length;
+            // totalItems calculated in loop
 
             let filtered = allEntries;
-            if (parsedCursor !== undefined) {
-                filtered = allEntries.filter(i => {
-                    if (sortDirection === "asc") return i.val > parsedCursor;
-                    return i.val < parsedCursor;
-                });
-            }
+            // Filter logic moved up
 
             const page = filtered.slice(0, pageSize);
             paginatedItems = page.map((i) => ({ key: i.key, data: i.data }));
@@ -489,18 +497,22 @@ async function getAll(req: Request, res: Response, next: NextFunction) {
             for (const key of game.map().keys()) {
                 const entry = game.get(key);
                 if (entry) {
-                    allEntries.push({
-                        key,
-                        data: entry.payload,
-                        cursor: entry.cursor,
-                    });
+                    totalItems++; // Count all items
+                    // Optimization: Filter before pushing
+                    if (!cursor || entry.cursor < cursor) {
+                        allEntries.push({
+                            key,
+                            data: entry.payload,
+                            cursor: entry.cursor,
+                        });
+                    }
                 }
             }
 
             let sorted = allEntries.sort((a, b) => b.cursor - a.cursor);
-            totalItems = sorted.length;
+            // totalItems = sorted.length; // Removed, now calculated in loop
 
-            if (cursor) sorted = sorted.filter((i) => i.cursor < cursor);
+            // if (cursor) sorted = sorted.filter((i) => i.cursor < cursor); // Moved up
 
             const page = sorted.slice(0, pageSize);
             paginatedItems = page.map((i) => ({ key: i.key, data: i.data }));
