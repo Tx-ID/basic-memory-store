@@ -18,6 +18,8 @@ const CacheSchema = new Schema<ICacheDoc>({
 });
 
 CacheSchema.index({ index: 1, key: 1 }, { unique: true });
-CacheSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 }); // MongoDB auto-removes expired docs
+CacheSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 });
+CacheSchema.index({ index: 1, cursor: -1 });
+CacheSchema.index({ "payload.$**": 1 });
 
 export const CacheModel = mongoose.model<ICacheDoc>("DynamicCache", CacheSchema);

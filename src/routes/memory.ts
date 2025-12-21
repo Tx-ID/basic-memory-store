@@ -24,7 +24,6 @@ function get_index_cache(idx: string) {
     return object;
 }
 
-
 // Background cleanup for In-Memory cache (every 5 mins)
 setInterval(() => {
     // Iterate indices to trigger lazy expiry or perform manual pruning if supported
@@ -39,7 +38,6 @@ setInterval(() => {
         }
     }
 }, 5 * 60 * 1000);
-
 
 // --- Validation Schemas ---
 const Query = z.object({
@@ -79,7 +77,6 @@ function parseValue(val: string | undefined): string | number | undefined {
     return isNaN(num) ? val : num;
 }
 
-
 // --- Routes ---
 async function set(req: Request, res: Response, next: NextFunction) {
     try {
@@ -99,9 +96,9 @@ async function set(req: Request, res: Response, next: NextFunction) {
 
         if (persist) {
             if (!isDbReady()) {
-                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({ 
-                    error: ReasonPhrases.SERVICE_UNAVAILABLE, 
-                    message: "Database not connected" 
+                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({
+                    error: ReasonPhrases.SERVICE_UNAVAILABLE,
+                    message: "Database not connected",
                 });
             }
 
@@ -130,9 +127,9 @@ async function del(req: Request, res: Response, next: NextFunction) {
 
         if (useDb) {
             if (!isDbReady()) {
-                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({ 
-                    error: ReasonPhrases.SERVICE_UNAVAILABLE, 
-                    message: "Database not connected" 
+                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({
+                    error: ReasonPhrases.SERVICE_UNAVAILABLE,
+                    message: "Database not connected",
                 });
             }
 
@@ -159,7 +156,14 @@ async function getSorted(req: Request, res: Response, next: NextFunction) {
             });
         }
 
-        const { pageSize, cursor, sortDirection, dataName, useDb, defaultValue } = safe.data;
+        const {
+            pageSize,
+            cursor,
+            sortDirection,
+            dataName,
+            useDb,
+            defaultValue,
+        } = safe.data;
         const parsedCursor = parseValue(cursor);
         const parsedDefaultValue = parseValue(defaultValue);
 
@@ -170,9 +174,9 @@ async function getSorted(req: Request, res: Response, next: NextFunction) {
 
         if (useDb) {
             if (!isDbReady()) {
-                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({ 
-                    error: ReasonPhrases.SERVICE_UNAVAILABLE, 
-                    message: "Database not connected" 
+                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({
+                    error: ReasonPhrases.SERVICE_UNAVAILABLE,
+                    message: "Database not connected",
                 });
             }
 
@@ -185,13 +189,20 @@ async function getSorted(req: Request, res: Response, next: NextFunction) {
                     { $match: { index } },
                     {
                         $addFields: {
-                            sortVal: { $ifNull: [`$payload.${dataName}`, parsedDefaultValue] }
-                        }
-                    }
+                            sortVal: {
+                                $ifNull: [
+                                    `$payload.${dataName}`,
+                                    parsedDefaultValue,
+                                ],
+                            },
+                        },
+                    },
                 ];
 
                 if (parsedCursor !== undefined) {
-                    pipeline.push({ $match: { sortVal: { [filterOp]: parsedCursor } } });
+                    pipeline.push({
+                        $match: { sortVal: { [filterOp]: parsedCursor } },
+                    });
                 }
 
                 pipeline.push({ $sort: { sortVal: sortOrder } });
@@ -202,7 +213,10 @@ async function getSorted(req: Request, res: Response, next: NextFunction) {
                 // For total items, we technically should count everything in index
                 totalItems = await CacheModel.countDocuments({ index });
 
-                paginatedItems = docs.map((d) => ({ key: d.key, data: d.payload }));
+                paginatedItems = docs.map((d) => ({
+                    key: d.key,
+                    data: d.payload,
+                }));
 
                 if (docs.length > 0) {
                     const last = docs[docs.length - 1];
@@ -213,17 +227,22 @@ async function getSorted(req: Request, res: Response, next: NextFunction) {
                         { $match: { index } },
                         {
                             $addFields: {
-                                sortVal: { $ifNull: [`$payload.${dataName}`, parsedDefaultValue] }
-                            }
+                                sortVal: {
+                                    $ifNull: [
+                                        `$payload.${dataName}`,
+                                        parsedDefaultValue,
+                                    ],
+                                },
+                            },
                         },
                         { $match: { sortVal: { [filterOp]: nextCursor } } },
                         { $limit: 1 },
-                        { $project: { _id: 1 } }
+                        { $project: { _id: 1 } },
                     ];
-                    const rem = await CacheModel.aggregate(checkPipeline).exec();
+                    const rem = await CacheModel.aggregate(checkPipeline)
+                        .exec();
                     hasMore = rem.length > 0;
                 }
-
             } else {
                 // Standard Find
                 const q: any = { index };
@@ -231,24 +250,39 @@ async function getSorted(req: Request, res: Response, next: NextFunction) {
                     q[`payload.${dataName}`] = { [filterOp]: parsedCursor };
                 }
                 // Filter out missing fields if no default value provided
-                q[`payload.${dataName}`] = { $exists: true, ...q[`payload.${dataName}`] };
+                q[`payload.${dataName}`] = {
+                    $exists: true,
+                    ...q[`payload.${dataName}`],
+                };
 
-                const docs = await CacheModel.find(q)
-                    .sort({ [`payload.${dataName}`]: sortOrder })
-                    .limit(pageSize)
-                    .lean();
+                const [docs, total] = await Promise.all([
+                    CacheModel.find(q)
+                        .sort({ [`payload.${dataName}`]: sortOrder })
+                        .limit(pageSize)
+                        .lean(),
+                    CacheModel.countDocuments({
+                        index,
+                        [`payload.${dataName}`]: { $exists: true },
+                    }),
+                ]);
 
-                totalItems = await CacheModel.countDocuments({ index, [`payload.${dataName}`]: { $exists: true } });
+                totalItems = total;
 
-                paginatedItems = docs.map((d) => ({ key: d.key, data: d.payload }));
+                paginatedItems = docs.map((d) => ({
+                    key: d.key,
+                    data: d.payload,
+                }));
 
                 if (docs.length > 0) {
                     const last = docs[docs.length - 1]!;
                     nextCursor = last.payload[dataName];
-                    
+
                     const checkQ = { ...q };
                     if (nextCursor !== undefined) {
-                        checkQ[`payload.${dataName}`] = { [filterOp]: nextCursor, $exists: true };
+                        checkQ[`payload.${dataName}`] = {
+                            [filterOp]: nextCursor,
+                            $exists: true,
+                        };
                     }
                     const rem = await CacheModel.findOne(checkQ).select("_id");
                     hasMore = !!rem;
@@ -264,14 +298,14 @@ async function getSorted(req: Request, res: Response, next: NextFunction) {
                     const val = entry.payload[dataName] ?? parsedDefaultValue;
                     if (val !== undefined) {
                         totalItems++;
-                        
+
                         let include = true;
                         if (parsedCursor !== undefined) {
-                             if (sortDirection === "asc") {
-                                 if (val <= parsedCursor) include = false;
-                             } else {
-                                 if (val >= parsedCursor) include = false;
-                             }
+                            if (sortDirection === "asc") {
+                                if (val <= parsedCursor) include = false;
+                            } else {
+                                if (val >= parsedCursor) include = false;
+                            }
                         }
 
                         if (include) {
@@ -320,7 +354,7 @@ async function getRank(req: Request, res: Response, next: NextFunction) {
     try {
         const index = String(req.params.index!);
         const key = String(req.params.id!);
-        
+
         const safe = SortedQuery.safeParse(req.query);
         if (!safe.success) {
             return res.status(StatusCodes.BAD_REQUEST).send({
@@ -335,55 +369,70 @@ async function getRank(req: Request, res: Response, next: NextFunction) {
 
         if (useDb) {
             if (!isDbReady()) {
-                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({ 
-                    error: ReasonPhrases.SERVICE_UNAVAILABLE, 
-                    message: "Database not connected" 
+                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({
+                    error: ReasonPhrases.SERVICE_UNAVAILABLE,
+                    message: "Database not connected",
                 });
             }
 
             const doc = await CacheModel.findOne({ index, key }).lean();
             if (!doc) {
-                return res.status(StatusCodes.NOT_FOUND).send({ error: ReasonPhrases.NOT_FOUND });
+                return res.status(StatusCodes.NOT_FOUND).send({
+                    error: ReasonPhrases.NOT_FOUND,
+                });
             }
 
             const targetVal = doc.payload[dataName] ?? parsedDefaultValue;
             if (targetVal === undefined) {
-                return res.status(StatusCodes.BAD_REQUEST).send({ error: "Field not found in data and no default provided" });
+                return res.status(StatusCodes.BAD_REQUEST).send({
+                    error: "Field not found in data and no default provided",
+                });
             }
 
             const filterOp = sortDirection === "asc" ? "$lt" : "$gt";
-            
+
             if (parsedDefaultValue !== undefined) {
                 const pipeline = [
                     { $match: { index } },
                     {
                         $addFields: {
-                            sortVal: { $ifNull: [`$payload.${dataName}`, parsedDefaultValue] }
-                        }
+                            sortVal: {
+                                $ifNull: [
+                                    `$payload.${dataName}`,
+                                    parsedDefaultValue,
+                                ],
+                            },
+                        },
                     },
                     { $match: { sortVal: { [filterOp]: targetVal } } },
-                    { $count: "count" }
+                    { $count: "count" },
                 ];
                 const result = await CacheModel.aggregate(pipeline).exec();
                 rank = (result[0]?.count || 0) + 1;
             } else {
                 const count = await CacheModel.countDocuments({
                     index,
-                    [`payload.${dataName}`]: { [filterOp]: targetVal, $exists: true }
+                    [`payload.${dataName}`]: {
+                        [filterOp]: targetVal,
+                        $exists: true,
+                    },
                 });
                 rank = count + 1;
             }
-
         } else {
             const game = get_index_cache(index);
             const entry = game.get(key);
             if (!entry) {
-                return res.status(StatusCodes.NOT_FOUND).send({ error: ReasonPhrases.NOT_FOUND });
+                return res.status(StatusCodes.NOT_FOUND).send({
+                    error: ReasonPhrases.NOT_FOUND,
+                });
             }
 
             const targetVal = entry.payload[dataName] ?? parsedDefaultValue;
             if (targetVal === undefined) {
-                return res.status(StatusCodes.BAD_REQUEST).send({ error: "Field not found in data and no default provided" });
+                return res.status(StatusCodes.BAD_REQUEST).send({
+                    error: "Field not found in data and no default provided",
+                });
             }
 
             let betterCount = 0;
@@ -407,7 +456,6 @@ async function getRank(req: Request, res: Response, next: NextFunction) {
             message: ReasonPhrases.OK,
             data: { rank },
         });
-
     } catch (error) {
         next(error);
     }
@@ -424,9 +472,9 @@ async function get(req: Request, res: Response, next: NextFunction) {
 
         if (useDb) {
             if (!isDbReady()) {
-                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({ 
-                    error: ReasonPhrases.SERVICE_UNAVAILABLE, 
-                    message: "Database not connected" 
+                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({
+                    error: ReasonPhrases.SERVICE_UNAVAILABLE,
+                    message: "Database not connected",
                 });
             }
 
@@ -463,21 +511,22 @@ async function getAll(req: Request, res: Response, next: NextFunction) {
 
         if (useDb) {
             if (!isDbReady()) {
-                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({ 
-                    error: ReasonPhrases.SERVICE_UNAVAILABLE, 
-                    message: "Database not connected" 
+                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({
+                    error: ReasonPhrases.SERVICE_UNAVAILABLE,
+                    message: "Database not connected",
                 });
             }
 
             const q: any = { index };
             if (cursor) q.cursor = { $lt: cursor };
 
-            const docs = await CacheModel.find(q).sort({ cursor: -1 }).limit(
-                pageSize,
-            ).lean();
+            const [docs, total] = await Promise.all([
+                CacheModel.find(q).sort({ cursor: -1 }).limit(pageSize).lean(),
+                // Note: Counting all docs is expensive; use estimate or careful indexing in prod
+                CacheModel.countDocuments({ index }),
+            ]);
 
-            // Note: Counting all docs is expensive; use estimate or careful indexing in prod
-            totalItems = await CacheModel.countDocuments({ index });
+            totalItems = total;
 
             paginatedItems = docs.map((d) => ({ key: d.key, data: d.payload }));
 
