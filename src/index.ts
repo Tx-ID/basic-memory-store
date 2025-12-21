@@ -3,6 +3,8 @@ import config from "./config/config";
 import mongoose from "mongoose";
 import { ApiKeyModel } from "./models/ApiKey";
 
+process.title = config.processTitle;
+
 async function initializeDatabase() {
     if (mongoose.connection.readyState >= 1) {
         console.log("Database connection already established.");

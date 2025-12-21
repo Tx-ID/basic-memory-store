@@ -9,6 +9,7 @@ interface Config {
     nodeEnv: string;
     keys: string[];
     MONGO_CONNECTION_URL: string,
+    processTitle: string;
 }
 
 //
@@ -22,6 +23,7 @@ const config: Config = {
     nodeEnv: process.env.NODE_ENV || "development",
     keys,
     MONGO_CONNECTION_URL: process.env.MONGO_CONNECTION_URL ?? "",
+    processTitle: process.env.PROCESS_TITLE || "basic-memory-store",
 };
 
 export default config;
