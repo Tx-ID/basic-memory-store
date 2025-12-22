@@ -93,4 +93,23 @@ export class TTLCache<K, V> {
         }
         return count;
     }
+
+    /**
+     * Asynchronously prunes expired items from the cache.
+     * Yields to the event loop every `chunkSize` items to avoid blocking.
+     */
+    public async prune(chunkSize = 1000): Promise<void> {
+        let checked = 0;
+        // Create a copy of keys to avoid modification issues during iteration, 
+        // though Map iteration handles deletion well, strictly speaking.
+        for (const key of this.cache.keys()) {
+            // has() triggers get() which triggers expiry check/cleanup
+            this.has(key);
+            
+            checked++;
+            if (checked % chunkSize === 0) {
+                await new Promise(resolve => setTimeout(resolve, 0));
+            }
+        }
+    }
 }

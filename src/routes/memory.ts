@@ -24,20 +24,44 @@ function get_index_cache(idx: string) {
     return object;
 }
 
-// Background cleanup for In-Memory cache (every 5 mins)
-setInterval(() => {
-    // Iterate indices to trigger lazy expiry or perform manual pruning if supported
-    for (const idx of cache.map().keys()) {
-        const game = cache.get(idx);
-        if (game) {
-            // size() will iterate all keys and trigger lazy expiry for them
-            if (game.size() === 0) {
-                // If the index cache is empty, remove it to prevent memory leaks
-                cache.delete(idx);
+// Background cleanup for In-Memory cache
+async function backgroundCleanup() {
+    try {
+        // Snapshot keys to iterate safely
+        const indices = Array.from(cache.map().keys());
+        
+        for (const idx of indices) {
+            // Access via get() to respect top-level TTL if any (though currently Infinity)
+            const game = cache.get(idx);
+            
+            if (game) {
+                // Optimization: If raw map is empty, delete immediately and skip prune
+                if (game.map().size === 0) {
+                    cache.delete(idx);
+                    continue;
+                }
+
+                // Async prune to avoid blocking event loop
+                await game.prune();
+
+                // If empty after prune, cleanup
+                if (game.map().size === 0) {
+                    cache.delete(idx);
+                }
             }
+            
+            // Yield to event loop between indices
+            await new Promise((resolve) => setTimeout(resolve, 0));
         }
+    } catch (error) {
+        console.error("Background cleanup error:", error);
+    } finally {
+        // Schedule next run
+        setTimeout(backgroundCleanup, 5 * 60 * 1000);
     }
-}, 5 * 60 * 1000);
+}
+// Start cleanup loop
+backgroundCleanup();
 
 // --- Validation Schemas ---
 const Query = z.object({
