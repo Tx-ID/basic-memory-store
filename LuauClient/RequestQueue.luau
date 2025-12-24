@@ -5,7 +5,7 @@ local queue = {}
 local processing = false
 
 -- Configuration
-local REQUESTS_PER_MINUTE = 500 -- Safe margin below Roblox's 500/min limit
+local REQUESTS_PER_MINUTE = 100 -- default: 500
 local DELAY_BETWEEN_REQUESTS = 60 / REQUESTS_PER_MINUTE
 
 function RequestQueue.enqueue(requestFunction, deduplicationKey: string?)

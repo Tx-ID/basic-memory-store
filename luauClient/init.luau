@@ -40,7 +40,7 @@ end
 -- Auto-pruning
 task.spawn(function()
 	while true do
-		task.wait(60) -- Prune every minute
+		task.wait(120) -- Prune every minute
 		local now = os.time()
 		for key, item in pairs(LocalCache.Storage) do
 			if now >= item.Expiration then
@@ -158,7 +158,16 @@ function HttpHashMap.SetAsync(self: TixHashMap, key: string, value: ValidValue, 
 	end
 end
 
-function HttpHashMap.GetAsync(self: TixHashMap, key: string)
+function HttpHashMap.GetAsync(self: TixHashMap, key: string, cacheOptions: { id: string?, ttl: number }?)
+	local cacheKey
+	if cacheOptions and cacheOptions.ttl then
+		cacheKey = cacheOptions.id or `Get_{self.Id}_{key}`
+		local cached = LocalCache.Get(cacheKey)
+		if cached then
+			return cached
+		end
+	end
+
 	local http_response = Http.request(self:_getPath(key), {
 		method = "GET",
 		headers = {
@@ -173,6 +182,11 @@ function HttpHashMap.GetAsync(self: TixHashMap, key: string)
 		end
 		error(`Failed to get HttpMemoryStore: {http_response.StatusCode}`)
 	end
+
+	if cacheKey then
+		LocalCache.Set(cacheKey, http_response.Body.data, cacheOptions.ttl)
+	end
+
 	return http_response.Body.data
 end
 

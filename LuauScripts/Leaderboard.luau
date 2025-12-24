@@ -21,10 +21,12 @@ type TixList = MemoryStoreClient.TixList
 
 export type Leaderboard = typeof(setmetatable({}, Leaderboard))
 
-function Leaderboard.new(boardId: string, useDb: boolean?)
+function Leaderboard.new(boardId: string, useDb: boolean?, useCache: boolean?)
 	local self = setmetatable({}, Leaderboard)
 	self._store = MemoryStoreClient:GetHashMap(boardId, useDb)
 	self._sortField = "Score" -- The JSON field used for ranking
+	self._useCache = useCache
+	self._cacheTtl = 60 -- Default cache duration
 	return self
 end
 
@@ -70,13 +72,18 @@ end
 -- Gets the player's Rank and their Data
 function Leaderboard.GetRank(self: Leaderboard, player: Player): RankResponse
 	local key = tostring(player.UserId)
+	
+	local cacheOptions = nil
+	if self._useCache then
+		cacheOptions = { ttl = self._cacheTtl }
+	end
 
-	-- GetRankAsync(key, dataName, sortDirection, defaultValue)
+	-- GetRankAsync(key, dataName, sortDirection, defaultValue, cacheOptions)
 	-- Using defaultValue = 0 ensures players not on the board yet are ranked as if they have 0 score
-	local rank = self._store:GetRankAsync(key, self._sortField, "desc", 0)
+	local rank = self._store:GetRankAsync(key, self._sortField, "desc", 0, cacheOptions)
 
 	-- Also fetch the actual data to return (e.g., to show their current score)
-	local data = self._store:GetAsync(key)
+	local data = self._store:GetAsync(key, cacheOptions)
 
 	return {
 		Rank = rank,
@@ -86,8 +93,13 @@ end
 
 -- Returns a PagingObject for iterating through the top players
 function Leaderboard.GetTop(self: Leaderboard, pageSize: number?): TixList
-	-- GetSortedAsync(dataName, sortDirection, sizePerPage, defaultValue)
-	return self._store:GetSortedAsync(self._sortField, "desc", pageSize or 50, 0)
+	local cacheOptions = nil
+	if self._useCache then
+		cacheOptions = { ttl = self._cacheTtl }
+	end
+	
+	-- GetSortedAsync(dataName, sortDirection, sizePerPage, defaultValue, cacheOptions)
+	return self._store:GetSortedAsync(self._sortField, "desc", pageSize or 50, 0, cacheOptions)
 end
 
 return Leaderboard
