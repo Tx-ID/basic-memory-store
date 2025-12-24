@@ -15,6 +15,42 @@ local Http = require(script:WaitForChild("Http"))
 local TimeParser = require(script:WaitForChild("TimeParser"))
 
 --
+local LocalCache = {}
+LocalCache.Storage = {}
+
+function LocalCache.Get(key)
+	local item = LocalCache.Storage[key]
+	if item then
+		if os.time() < item.Expiration then
+			return item.Data
+		else
+			LocalCache.Storage[key] = nil
+		end
+	end
+	return nil
+end
+
+function LocalCache.Set(key, data, ttl)
+	LocalCache.Storage[key] = {
+		Data = data,
+		Expiration = os.time() + (ttl or 60)
+	}
+end
+
+-- Auto-pruning
+task.spawn(function()
+	while true do
+		task.wait(60) -- Prune every minute
+		local now = os.time()
+		for key, item in pairs(LocalCache.Storage) do
+			if now >= item.Expiration then
+				LocalCache.Storage[key] = nil
+			end
+		end
+	end
+end)
+
+--
 local ListInterface = {}
 ListInterface.__index = ListInterface
 
@@ -217,7 +253,8 @@ function HttpHashMap.GetSortedAsync(
 	dataName: string,
 	sortDirection: "asc" | "desc",
 	sizePerPage: number,
-	defaultValue: any?
+	defaultValue: any?,
+	cacheOptions: { id: string?, ttl: number }?
 )
 	sizePerPage = sizePerPage or 50
 	sortDirection = sortDirection or "desc"
@@ -225,6 +262,17 @@ function HttpHashMap.GetSortedAsync(
 	return ListInterface.new({
 		sizePerPage = sizePerPage,
 		getResponseByCursor = function(size: number, cursor: any?)
+			local cacheKey
+			if cacheOptions and cacheOptions.ttl then
+				local base = cacheOptions.id or `Sorted_{self.Id}_{dataName}_{sortDirection}_{defaultValue or "nil"}_{size}`
+				cacheKey = `{base}_{tostring(cursor or "start")}`
+
+				local cached = LocalCache.Get(cacheKey)
+				if cached then
+					return cached
+				end
+			end
+
 			local query = {
 				pageSize = size,
 				dataName = dataName,
@@ -243,6 +291,11 @@ function HttpHashMap.GetSortedAsync(
 				},
 				params = self:_getParams(query),
 			})
+
+			if cacheKey and http_response.Success then
+				LocalCache.Set(cacheKey, http_response, cacheOptions.ttl)
+			end
+
 			if not http_response.Success then
 				warn(`Failed to get sorted page HttpMemoryStore: {http_response.StatusCode}`)
 				return { Success = false }
@@ -281,9 +334,20 @@ function HttpHashMap.GetRankAsync(
 	key: string,
 	dataName: string,
 	sortDirection: "asc" | "desc",
-	defaultValue: any?
+	defaultValue: any?,
+	cacheOptions: { id: string?, ttl: number }?
 )
 	sortDirection = sortDirection or "desc"
+
+	local cacheKey
+	if cacheOptions and cacheOptions.ttl then
+		cacheKey = cacheOptions.id or `Rank_{self.Id}_{key}_{dataName}_{sortDirection}_{defaultValue or "nil"}`
+		local cached = LocalCache.Get(cacheKey)
+		if cached then
+			return cached
+		end
+	end
+
 	local path = `{self:_getPath()}/rank/{HttpService:UrlEncode(key)}`
 
 	local http_response = Http.request(path, {
@@ -304,6 +368,10 @@ function HttpHashMap.GetRankAsync(
 			return nil
 		end
 		error(`Failed to get rank HttpMemoryStore: {http_response.StatusCode}`)
+	end
+
+	if cacheKey then
+		LocalCache.Set(cacheKey, http_response.Body.data.rank, cacheOptions.ttl)
 	end
 
 	return http_response.Body.data.rank
