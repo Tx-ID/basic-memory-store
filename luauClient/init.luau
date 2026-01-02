@@ -9,7 +9,11 @@ local ConfigData: { key: string? } = Snapshot and Snapshot:GetValue("tixmemory")
 
 local BASE_URL = ConfigData.url or ""
 local AUTHORIZATION_KEY = `Bearer {ConfigData.key or ""}`
-local DEFAULT_EXPIRATION = 60 * 5
+local GlobalConfig = {
+	DefaultExpiration = 60 * 5,
+	LocalCacheDefaultTTL = 60,
+	LocalCachePruneInterval = 120,
+}
 
 local Http = require(script:WaitForChild("Http"))
 local TimeParser = require(script:WaitForChild("TimeParser"))
@@ -33,14 +37,14 @@ end
 function LocalCache.Set(key, data, ttl)
 	LocalCache.Storage[key] = {
 		Data = data,
-		Expiration = os.time() + (ttl or 60)
+		Expiration = os.time() + (ttl or GlobalConfig.LocalCacheDefaultTTL)
 	}
 end
 
 -- Auto-pruning
 task.spawn(function()
 	while true do
-		task.wait(120) -- Prune every minute
+		task.wait(GlobalConfig.LocalCachePruneInterval)
 		local now = os.time()
 		for key, item in pairs(LocalCache.Storage) do
 			if now >= item.Expiration then
@@ -112,10 +116,61 @@ local HttpHashMap = {}
 HttpHashMap.__index = HttpHashMap
 
 function HttpHashMap.new(id: string, useDb: boolean?)
-	return setmetatable({
+	local self = setmetatable({
 		Id = id,
 		UseDb = useDb == true,
+		_queue = {},
+		_queueCount = 0,
+		_queueTTL = nil,
+		_lastFirstItemTime = 0,
+		_batchConfig = {
+			enabled = true,
+			minSize = 1,
+			maxSize = 100,
+			waitTime = 1,
+			delayPerBatch = 0,
+			forceWaitTime = 0,
+		},
 	}, HttpHashMap)
+
+	task.spawn(function()
+		while true do
+			task.wait(0.1)
+			if self._batchConfig.enabled and self._queueCount > 0 then
+				local shouldFlush = false
+				local now = os.time()
+
+				-- Check conditions
+				if self._queueCount >= self._batchConfig.maxSize then
+					shouldFlush = true
+				elseif self._queueCount >= self._batchConfig.minSize then
+					if now - self._lastFirstItemTime >= self._batchConfig.waitTime then
+						shouldFlush = true
+					end
+				elseif self._batchConfig.forceWaitTime > 0 then
+					if now - self._lastFirstItemTime >= self._batchConfig.forceWaitTime then
+						shouldFlush = true
+					end
+				end
+
+				if shouldFlush then
+					local batch = self._queue
+					local ttl = self._queueTTL
+
+					self._queue = {}
+					self._queueCount = 0
+					self._queueTTL = nil
+					self._lastFirstItemTime = 0
+
+					task.spawn(function()
+						self:BatchSetAsync(batch, ttl)
+					end)
+				end
+			end
+		end
+	end)
+
+	return self
 end
 export type TixHashMap = typeof(HttpHashMap.new("test-id"))
 export type ValidValue = string | number | { [any]: any } | { any }
@@ -138,7 +193,7 @@ function HttpHashMap._getParams(self: TixHashMap, extra: { [string]: any }?)
 end
 
 function HttpHashMap.SetAsync(self: TixHashMap, key: string, value: ValidValue, expiration: Expiration)
-	local ttl = TimeParser.parse(expiration) or DEFAULT_EXPIRATION
+	local ttl = TimeParser.parse(expiration) or GlobalConfig.DefaultExpiration
 	local http_response = Http.request(self:_getPath(key), {
 		method = "POST",
 		headers = {
@@ -188,6 +243,158 @@ function HttpHashMap.GetAsync(self: TixHashMap, key: string, cacheOptions: { id:
 	end
 
 	return http_response.Body.data
+end
+
+function HttpHashMap.ConfigureBatching(self: TixHashMap, config: {
+	enabled: boolean?,
+	minBatchSize: number?,
+	maxBatchSize: number?,
+	waitTime: number?,
+	delayPerBatch: number?,
+	forceWaitTime: number?
+})
+	if config.enabled ~= nil then self._batchConfig.enabled = config.enabled end
+	if config.minBatchSize then self._batchConfig.minSize = config.minBatchSize end
+	if config.maxBatchSize then self._batchConfig.maxSize = config.maxBatchSize end
+	if config.waitTime then self._batchConfig.waitTime = config.waitTime end
+	if config.delayPerBatch then self._batchConfig.delayPerBatch = config.delayPerBatch end
+	if config.forceWaitTime then self._batchConfig.forceWaitTime = config.forceWaitTime end
+end
+
+function HttpHashMap.QueueBatchSetAsync(self: TixHashMap, key: string, value: ValidValue, expiration: Expiration)
+	if not self._queue[key] then
+		self._queueCount += 1
+		if self._queueCount == 1 then
+			self._lastFirstItemTime = os.time()
+		end
+	end
+	self._queue[key] = value
+	if expiration then
+		self._queueTTL = expiration
+	end
+
+	-- Immediate flush if maxSize reached
+	if self._batchConfig.enabled and self._queueCount >= self._batchConfig.maxSize then
+		local batch = self._queue
+		local ttl = self._queueTTL
+
+		self._queue = {}
+		self._queueCount = 0
+		self._queueTTL = nil
+		self._lastFirstItemTime = 0
+
+		task.spawn(function()
+			self:BatchSetAsync(batch, ttl)
+		end)
+	end
+end
+
+function HttpHashMap.BatchSetAsync(self: TixHashMap, items: { [string]: any }, expiration: Expiration)
+	local ttl = TimeParser.parse(expiration) or GlobalConfig.DefaultExpiration
+	local payloadItems = {}
+	for k, v in pairs(items) do
+		table.insert(payloadItems, { key = k, data = v })
+	end
+
+	local function sendBatch(batch)
+		local path = `{BASE_URL}/{self.Id}/batch/set`
+		local http_response = Http.request(path, {
+			method = "POST",
+			headers = {
+				authorization = AUTHORIZATION_KEY,
+				["content-type"] = "application/json",
+			},
+			params = self:_getParams(),
+			data = {
+				ttl = ttl,
+				items = batch,
+				persist = self.UseDb,
+			},
+		})
+		if not http_response.Success then
+			error(`Failed to batch set HttpMemoryStore: {http_response.StatusCode}`)
+		end
+	end
+
+	local chunk = {}
+	for _, item in ipairs(payloadItems) do
+		table.insert(chunk, item)
+		if #chunk >= 100 then
+			sendBatch(chunk)
+			chunk = {}
+			if self._batchConfig.delayPerBatch > 0 then
+				task.wait(self._batchConfig.delayPerBatch)
+			end
+		end
+	end
+	if #chunk > 0 then
+		sendBatch(chunk)
+	end
+end
+
+function HttpHashMap.BatchGetAsync(self: TixHashMap, keys: { string }, cacheOptions: { id: string?, ttl: number }?)
+	local results = {}
+	local keysToFetch = {}
+
+	if cacheOptions and cacheOptions.ttl then
+		for _, key in pairs(keys) do
+			local cacheKey = cacheOptions.id and `{cacheOptions.id}_{key}` or `Get_{self.Id}_{key}`
+			local cached = LocalCache.Get(cacheKey)
+			if cached then
+				results[key] = cached
+			else
+				table.insert(keysToFetch, key)
+			end
+		end
+	else
+		keysToFetch = keys
+	end
+
+	local function fetchBatch(batchKeys)
+		local path = `{BASE_URL}/{self.Id}/batch/get`
+		local http_response = Http.request(path, {
+			method = "POST",
+			headers = {
+				authorization = AUTHORIZATION_KEY,
+				["content-type"] = "application/json",
+			},
+			params = self:_getParams(),
+			data = {
+				keys = batchKeys,
+				useDb = self.UseDb,
+			},
+		})
+
+		if not http_response.Success then
+			error(`Failed to batch get HttpMemoryStore: {http_response.StatusCode}`)
+		end
+
+		local data = http_response.Body.data or {}
+		for _, item in pairs(data) do
+			results[item.key] = item.data
+
+			if cacheOptions and cacheOptions.ttl then
+				local cacheKey = cacheOptions.id and `{cacheOptions.id}_{item.key}` or `Get_{self.Id}_{item.key}`
+				LocalCache.Set(cacheKey, item.data, cacheOptions.ttl)
+			end
+		end
+	end
+
+	if #keysToFetch > 0 then
+		local chunk = {}
+		for _, key in pairs(keysToFetch) do
+			table.insert(chunk, key)
+			if #chunk >= 100 then
+				fetchBatch(chunk)
+				chunk = {}
+			end
+		end
+		if #chunk > 0 then
+			fetchBatch(chunk)
+		end
+	end
+
+	return results
 end
 
 function HttpHashMap.AllItemsAsync(self: TixHashMap)
@@ -423,6 +630,16 @@ end
 --
 local this = {}
 local cache = { HashMap = {} }
+
+function this.Configure(config: {
+	DefaultExpiration: number?,
+	LocalCacheDefaultTTL: number?,
+	LocalCachePruneInterval: number?
+})
+	if config.DefaultExpiration then GlobalConfig.DefaultExpiration = config.DefaultExpiration end
+	if config.LocalCacheDefaultTTL then GlobalConfig.LocalCacheDefaultTTL = config.LocalCacheDefaultTTL end
+	if config.LocalCachePruneInterval then GlobalConfig.LocalCachePruneInterval = config.LocalCachePruneInterval end
+end
 
 function this:GetHashMap(id: string, useDb: boolean?)
 	local cacheKey = `{id}_{useDb and "db" or "mem"}`

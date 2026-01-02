@@ -85,6 +85,20 @@ const Body = z.object({
     persist: z.boolean().default(false), // Toggle DB Write
 });
 
+const BatchSetBody = z.object({
+    ttl: z.number().int().default(2 * 60),
+    items: z.array(z.object({
+        key: z.string(),
+        data: z.any()
+    })).max(100),
+    persist: z.boolean().default(false),
+});
+
+const BatchGetBody = z.object({
+    keys: z.array(z.string()).max(100),
+    useDb: z.boolean().default(false),
+});
+
 const isDbReady = () => mongoose.connection.readyState === 1;
 
 // Helper to handle mixed type comparison
@@ -102,6 +116,100 @@ function parseValue(val: string | undefined): string | number | undefined {
 }
 
 // --- Routes ---
+
+async function batchSet(req: Request, res: Response, next: NextFunction) {
+    try {
+        const index = String(req.params.index!);
+        
+        const safe = BatchSetBody.safeParse(req.body);
+        if (!safe.success) {
+            return res.status(StatusCodes.BAD_REQUEST).send({
+                error: ReasonPhrases.BAD_REQUEST,
+                error_data: safe.error.issues,
+            });
+        }
+
+        const { ttl, items, persist } = safe.data;
+        const cursor = Date.now();
+
+        if (persist) {
+            if (!isDbReady()) {
+                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({
+                    error: ReasonPhrases.SERVICE_UNAVAILABLE,
+                    message: "Database not connected",
+                });
+            }
+
+            const expireAt = new Date(Date.now() + (ttl * 1000));
+            const operations = items.map(item => ({
+                updateOne: {
+                    filter: { index, key: item.key },
+                    update: { payload: item.data, cursor, expireAt },
+                    upsert: true
+                }
+            }));
+
+            await CacheModel.bulkWrite(operations);
+        } else {
+            const game = get_index_cache(index);
+            for (const item of items) {
+                game.set(item.key, { payload: item.data, cursor }, ttl);
+            }
+        }
+
+        res.status(StatusCodes.OK).send({ message: ReasonPhrases.OK });
+    } catch (error) {
+        next(error);
+    }
+}
+router.post("/:index/batch/set", batchSet);
+
+async function batchGet(req: Request, res: Response, next: NextFunction) {
+    try {
+        const index = String(req.params.index!);
+        
+        const safe = BatchGetBody.safeParse(req.body);
+        if (!safe.success) {
+            return res.status(StatusCodes.BAD_REQUEST).send({
+                error: ReasonPhrases.BAD_REQUEST,
+                error_data: safe.error.issues,
+            });
+        }
+
+        const { keys, useDb } = safe.data;
+        const results: { key: string, data: any }[] = [];
+
+        if (useDb) {
+            if (!isDbReady()) {
+                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({
+                    error: ReasonPhrases.SERVICE_UNAVAILABLE,
+                    message: "Database not connected",
+                });
+            }
+
+            const docs = await CacheModel.find({ index, key: { $in: keys } }).lean();
+            // Map results to preserve order or just return what found? 
+            // Usually batch get returns a map or list. Let's return list of found items.
+            for (const doc of docs) {
+                results.push({ key: doc.key, data: doc.payload });
+            }
+        } else {
+            const game = get_index_cache(index);
+            for (const key of keys) {
+                const entry = game.get(key);
+                if (entry) {
+                    results.push({ key, data: entry.payload });
+                }
+            }
+        }
+
+        res.status(StatusCodes.OK).send({ message: ReasonPhrases.OK, data: results });
+    } catch (error) {
+        next(error);
+    }
+}
+router.post("/:index/batch/get", batchGet);
+
 async function set(req: Request, res: Response, next: NextFunction) {
     try {
         const index = String(req.params.index!);

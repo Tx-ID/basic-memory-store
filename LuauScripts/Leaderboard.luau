@@ -24,13 +24,34 @@ export type Leaderboard = typeof(setmetatable({}, Leaderboard))
 function Leaderboard.new(boardId: string, useDb: boolean?, useCache: boolean?)
 	local self = setmetatable({}, Leaderboard)
 	self._store = MemoryStoreClient:GetHashMap(boardId, useDb)
+
+	-- Default batching configuration to reduce HTTP usage
+	self._store:ConfigureBatching({
+		enabled = true,
+		minBatchSize = 5,
+		maxBatchSize = 50,
+		waitTime = 5, -- Wait up to 5 seconds before flushing if minBatchSize is met
+		forceWaitTime = 60, -- Always flush after 60 seconds regardless of batch size
+	})
+
 	self._sortField = "Score" -- The JSON field used for ranking
 	self._useCache = useCache
 	self._cacheTtl = 60 -- Default cache duration
 	return self
 end
 
--- Sets the player's score directly
+function Leaderboard.ConfigureBatching(self: Leaderboard, config: {
+	enabled: boolean?,
+	minBatchSize: number?,
+	maxBatchSize: number?,
+	waitTime: number?,
+	delayPerBatch: number?,
+	forceWaitTime: number?
+})
+	self._store:ConfigureBatching(config)
+end
+
+-- Sets the player's score (queued for batch update)
 function Leaderboard.SetScore(self: Leaderboard, player: Player, score: number, expiration: (string | number)?)
 	local key = tostring(player.UserId)
 	local data = {
@@ -41,7 +62,7 @@ function Leaderboard.SetScore(self: Leaderboard, player: Player, score: number, 
 	}
 
 	-- Expires in 30 days by default to keep the board fresh, or adjust as needed
-	self._store:SetAsync(key, data, expiration or DEFAULT_EXPIRATION)
+	self._store:QueueBatchSetAsync(key, data, expiration or DEFAULT_EXPIRATION)
 end
 
 -- Increments the player's existing score
