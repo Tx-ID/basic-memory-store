@@ -1,27 +1,113 @@
+--[=[
+	API Reference:
+	
+	### TixMemoryStore (Module)
+	* .Configure(config: ClientConfig) -> void
+	  > Updates global client settings like default timeouts and cache pruning intervals.
+	
+	* :GetHashMap(id: string, useDb: boolean?) -> HttpHashMap
+	  > Returns a handle to a specific memory store map. 'useDb' enables persistent storage.
+	
+	### HttpHashMap (Instance)
+	* :SetAsync(key: string, value: ValidValue, expiration: Expiration) -> void
+	  > Sets a key-value pair with a Time-To-Live (TTL).
+	
+	* :GetAsync(key: string, cacheOptions: CacheOptions?) -> any?
+	  > Retrieves a value. Optional 'cacheOptions' enables local caching.
+	
+	* :ConfigureBatching(config: BatchConfig) -> void
+	  > Sets up auto-batching parameters (enabled, max size, wait times) for QueueBatchSetAsync.
+	
+	* :QueueBatchSetAsync(key: string, value: ValidValue, expiration: Expiration) -> void
+	  > Adds an item to the background batch queue. Flushes automatically based on config.
+	
+	* :BatchSetAsync(items: {[string]: any}, expiration: Expiration) -> void
+	  > Immediately sends a batch of items to the server.
+	
+	* :BatchGetAsync(keys: {string}, cacheOptions: CacheOptions?) -> {[string]: any}
+	  > Retrieves multiple keys in a single request.
+	
+	* :AllItemsAsync() -> {{key: string, value: any}}
+	  > Fetches all items in the map (internally paginated). Use with caution on large maps.
+	
+	* :ListItemsAsync(sizePerPage: number) -> TixList (Iterator)
+	  > Returns an iterator object to page through the map's items.
+	
+	* :GetSortedAsync(dataName: string, sortDirection: "asc"|"desc", sizePerPage: number, defaultValue: any?, cacheOptions: CacheOptions?) -> TixList
+	  > Returns an iterator for items sorted by a specific field inside the value.
+	
+	* :GetRankAsync(key: string, dataName: string, sortDirection: "asc"|"desc", defaultValue: any?, cacheOptions: CacheOptions?) -> number?
+	  > Gets the numeric rank of an item in the sorted list.
+	
+	* :UpdateAsync(key: string, transform_function: (oldData: any)->newData: any, expiration: Expiration) -> void
+	  > Fetches, transforms, and then sets the data (Read-Modify-Write).
+	
+	* :RemoveAsync(key: string) -> void
+	  > Deletes a key from the store.
+	
+	### Types
+	* ValidValue = string | number | table
+	* Expiration = number (seconds) | string (e.g. "5m", "1h")
+	* CacheOptions = { id: string?, ttl: number }
+]=]
+
+--[=[
+	@class TixMemoryClient
+	
+	A robust Luau client for interacting with the TixMemory service (Basic Memory Store).
+	This client handles HTTP requests, local caching, batching, and pagination for interacting
+	with the external memory store API.
+	
+	Features:
+	- Key-Value storage with expiration (TTL)
+	- In-memory local caching to reduce HTTP overhead
+	- Automatic batching for high-throughput Set operations
+	- Sorted lists and ranking capabilities
+	- Pagination for large datasets
+]=]
+
 local HttpService = game:GetService("HttpService")
 
---
+-- Service Dependencies
 local ConfigService = require(script:WaitForChild("ConfigService"))
 
+-- Wait for configuration to be ready
 _ = ConfigService.getConfig() or ConfigService.ConfigAdded:Wait()
 local Snapshot = ConfigService.getConfig()
 local ConfigData: { key: string? } = Snapshot and Snapshot:GetValue("tixmemory") or {}
 
 local BASE_URL = ConfigData.url or ""
 local AUTHORIZATION_KEY = `Bearer {ConfigData.key or ""}`
+
+--[=[
+	Global configuration defaults for the client.
+	Can be modified via `TixMemoryClient.Configure`.
+]=]
 local GlobalConfig = {
-	DefaultExpiration = 60 * 5,
-	LocalCacheDefaultTTL = 60,
-	LocalCachePruneInterval = 120,
+	DefaultExpiration = 60 * 5, -- Default TTL for items on the server (5 minutes)
+	LocalCacheDefaultTTL = 60, -- Default TTL for items in the local cache (1 minute)
+	LocalCachePruneInterval = 120, -- How often to clean up expired local cache items (2 minutes)
 }
 
 local Http = require(script:WaitForChild("Http"))
 local TimeParser = require(script:WaitForChild("TimeParser"))
 
---
+--[=[
+	@class LocalCache
+	@private
+	
+	A simple internal cache implementation with Time-To-Live (TTL) support.
+	Used to cache `GetAsync` results and reduce API calls.
+]=]
 local LocalCache = {}
 LocalCache.Storage = {}
 
+--[=[
+	Retrieves an item from the local cache if it exists and hasn't expired.
+	
+	@param key string -- The cache key
+	@return any? -- The cached data or nil
+]=]
 function LocalCache.Get(key)
 	local item = LocalCache.Storage[key]
 	if item then
@@ -34,6 +120,13 @@ function LocalCache.Get(key)
 	return nil
 end
 
+--[=[
+	Sets an item in the local cache with a specified TTL.
+	
+	@param key string -- The cache key
+	@param data any -- The data to store
+	@param ttl number? -- Time to live in seconds (defaults to GlobalConfig.LocalCacheDefaultTTL)
+]=]
 function LocalCache.Set(key, data, ttl)
 	LocalCache.Storage[key] = {
 		Data = data,
@@ -41,7 +134,7 @@ function LocalCache.Set(key, data, ttl)
 	}
 end
 
--- Auto-pruning
+-- Background task for pruning expired items from LocalCache
 task.spawn(function()
 	while true do
 		task.wait(GlobalConfig.LocalCachePruneInterval)
@@ -54,10 +147,21 @@ task.spawn(function()
 	end
 end)
 
---
+--[=[
+	@class ListInterface
+	
+	An iterator object for handling paginated responses from the API.
+	Allows traversing through pages of data seamlessly.
+]=]
 local ListInterface = {}
 ListInterface.__index = ListInterface
 
+--[=[
+	Creates a new ListInterface instance.
+	@private
+	@param controls table -- Internal control functions for fetching data
+	@return TixList
+]=]
 function ListInterface.new(controls: {
 	sizePerPage: number,
 	getResponseByCursor: (maxSize: number, cursor: any?) -> any,
@@ -78,6 +182,11 @@ function ListInterface.new(controls: {
 end
 export type TixList = typeof(ListInterface.new(nil))
 
+--[=[
+	Gets the items on the current page.
+	
+	@return { { key: string, value: any } } -- List of items
+]=]
 function ListInterface.GetCurrentPage(self: TixList)
 	if self._response then
 		return self._controls.getListFromResponse(self._response)
@@ -85,6 +194,10 @@ function ListInterface.GetCurrentPage(self: TixList)
 	return {}
 end
 
+--[=[
+	Internal method to fetch the current page data using the cursor.
+	@private
+]=]
 function ListInterface._fetchCurrentPageAsync(self: TixList)
 	local cursor = nil
 	if self._response then
@@ -103,6 +216,10 @@ function ListInterface._fetchCurrentPageAsync(self: TixList)
 	end
 end
 
+--[=[
+	Advances the iterator to the next page of results.
+	Does nothing if `IsFinished` is true.
+]=]
 function ListInterface.AdvanceToNextPageAsync(self: TixList)
 	if self.IsFinished then
 		return
@@ -111,10 +228,22 @@ function ListInterface.AdvanceToNextPageAsync(self: TixList)
 	self:_fetchCurrentPageAsync()
 end
 
---
+--[=[
+	@class HttpHashMap
+	
+	Represents a connection to a specific map/collection in the memory store.
+	Provides methods for CRUD operations, batching, and sorting.
+]=]
 local HttpHashMap = {}
 HttpHashMap.__index = HttpHashMap
 
+--[=[
+	Creates a new HttpHashMap instance.
+	
+	@param id string -- The unique identifier for this map/collection
+	@param useDb boolean? -- If true, enables persistent storage (if supported by server backend)
+	@return TixHashMap
+]=]
 function HttpHashMap.new(id: string, useDb: boolean?)
 	local self = setmetatable({
 		Id = id,
@@ -133,6 +262,7 @@ function HttpHashMap.new(id: string, useDb: boolean?)
 		},
 	}, HttpHashMap)
 
+	-- Background task for processing the auto-batching queue
 	task.spawn(function()
 		while true do
 			task.wait(0.1)
@@ -140,7 +270,7 @@ function HttpHashMap.new(id: string, useDb: boolean?)
 				local shouldFlush = false
 				local now = os.time()
 
-				-- Check conditions
+				-- Check flush conditions based on queue size and wait time
 				if self._queueCount >= self._batchConfig.maxSize then
 					shouldFlush = true
 				elseif self._queueCount >= self._batchConfig.minSize then
@@ -176,6 +306,10 @@ export type TixHashMap = typeof(HttpHashMap.new("test-id"))
 export type ValidValue = string | number | { [any]: any } | { any }
 export type Expiration = number | string?
 
+--[=[
+	Constructs the API path for a given key.
+	@private
+]=]
 function HttpHashMap._getPath(self: TixHashMap, key: string?)
 	local path = `{BASE_URL}/{self.Id}`
 	if key then
@@ -184,6 +318,10 @@ function HttpHashMap._getPath(self: TixHashMap, key: string?)
 	return path
 end
 
+--[=[
+	Constructs the URL parameters for requests.
+	@private
+]=]
 function HttpHashMap._getParams(self: TixHashMap, extra: { [string]: any }?)
 	local params = extra or {}
 	if self.UseDb then
@@ -192,6 +330,13 @@ function HttpHashMap._getParams(self: TixHashMap, extra: { [string]: any }?)
 	return params
 end
 
+--[=[
+	Sets a value for a specific key in the memory store.
+	
+	@param key string -- The key to set
+	@param value ValidValue -- The value to store
+	@param expiration Expiration -- TTL in seconds or a time string (e.g. "5m")
+]=]
 function HttpHashMap.SetAsync(self: TixHashMap, key: string, value: ValidValue, expiration: Expiration)
 	local ttl = TimeParser.parse(expiration) or GlobalConfig.DefaultExpiration
 	local http_response = Http.request(self:_getPath(key), {
@@ -213,6 +358,14 @@ function HttpHashMap.SetAsync(self: TixHashMap, key: string, value: ValidValue, 
 	end
 end
 
+--[=[
+	Retrieves a value for a specific key.
+	
+	@param key string -- The key to retrieve
+	@param cacheOptions { id: string?, ttl: number }? -- Optional local caching settings. 
+		If provided, checks local cache first and caches the result on success.
+	@return any? -- The retrieved value or nil
+]=]
 function HttpHashMap.GetAsync(self: TixHashMap, key: string, cacheOptions: { id: string?, ttl: number }?)
 	local cacheKey
 	if cacheOptions and cacheOptions.ttl then
@@ -245,6 +398,17 @@ function HttpHashMap.GetAsync(self: TixHashMap, key: string, cacheOptions: { id:
 	return http_response.Body.data
 end
 
+--[=[
+	Configures the automatic batching behavior for `QueueBatchSetAsync`.
+	
+	@param config table
+		- enabled: boolean?
+		- minBatchSize: number?
+		- maxBatchSize: number?
+		- waitTime: number? -- Seconds to wait before flushing if minBatchSize reached
+		- delayPerBatch: number? -- Throttle between batch requests
+		- forceWaitTime: number? -- Max seconds to wait before forcing a flush
+]=]
 function HttpHashMap.ConfigureBatching(self: TixHashMap, config: {
 	enabled: boolean?,
 	minBatchSize: number?,
@@ -261,6 +425,14 @@ function HttpHashMap.ConfigureBatching(self: TixHashMap, config: {
 	if config.forceWaitTime then self._batchConfig.forceWaitTime = config.forceWaitTime end
 end
 
+--[=[
+	Queues a Set operation to be executed in a batch.
+	Highly recommended for high-frequency writes to reduce API calls.
+	
+	@param key string
+	@param value ValidValue
+	@param expiration Expiration
+]=]
 function HttpHashMap.QueueBatchSetAsync(self: TixHashMap, key: string, value: ValidValue, expiration: Expiration)
 	if not self._queue[key] then
 		self._queueCount += 1
@@ -289,6 +461,12 @@ function HttpHashMap.QueueBatchSetAsync(self: TixHashMap, key: string, value: Va
 	end
 end
 
+--[=[
+	Immediately executes a batch Set operation for multiple items.
+	
+	@param items { [string]: any } -- Map of key-value pairs to set
+	@param expiration Expiration
+]=]
 function HttpHashMap.BatchSetAsync(self: TixHashMap, items: { [string]: any }, expiration: Expiration)
 	local ttl = TimeParser.parse(expiration) or GlobalConfig.DefaultExpiration
 	local payloadItems = {}
@@ -316,6 +494,7 @@ function HttpHashMap.BatchSetAsync(self: TixHashMap, items: { [string]: any }, e
 		end
 	end
 
+	-- Chunk requests to avoid hitting payload limits (max 100 per chunk)
 	local chunk = {}
 	for _, item in ipairs(payloadItems) do
 		table.insert(chunk, item)
@@ -332,6 +511,13 @@ function HttpHashMap.BatchSetAsync(self: TixHashMap, items: { [string]: any }, e
 	end
 end
 
+--[=[
+	Performs a batch Get operation for multiple keys.
+	
+	@param keys { string } -- List of keys to retrieve
+	@param cacheOptions { id: string?, ttl: number }? -- Optional local caching
+	@return { [string]: any } -- Map of retrieved key-value pairs
+]=]
 function HttpHashMap.BatchGetAsync(self: TixHashMap, keys: { string }, cacheOptions: { id: string?, ttl: number }?)
 	local results = {}
 	local keysToFetch = {}
@@ -397,6 +583,12 @@ function HttpHashMap.BatchGetAsync(self: TixHashMap, keys: { string }, cacheOpti
 	return results
 end
 
+--[=[
+	Retrieves all items in the map (paginated internally, returns simple list).
+	Warning: Can be slow for very large collections.
+	
+	@return { { key: string, value: any } }
+]=]
 function HttpHashMap.AllItemsAsync(self: TixHashMap)
 	local http_response = Http.request(self:_getPath(), {
 		method = "GET",
@@ -418,6 +610,12 @@ function HttpHashMap.AllItemsAsync(self: TixHashMap)
 	return list
 end
 
+--[=[
+	Returns a ListInterface iterator to paginate through items.
+	
+	@param sizePerPage number -- Items per page
+	@return TixList
+]=]
 function HttpHashMap.ListItemsAsync(self: TixHashMap, sizePerPage: number)
 	sizePerPage = sizePerPage or 50
 	return ListInterface.new({
@@ -469,6 +667,16 @@ function HttpHashMap.ListItemsAsync(self: TixHashMap, sizePerPage: number)
 	})
 end
 
+--[=[
+	Retrieves a sorted list of items based on a specific data field.
+	
+	@param dataName string -- The field name within the stored data objects to sort by
+	@param sortDirection "asc" | "desc"
+	@param sizePerPage number
+	@param defaultValue any? -- Default value if the field is missing
+	@param cacheOptions table?
+	@return TixList
+]=]
 function HttpHashMap.GetSortedAsync(
 	self: TixHashMap,
 	dataName: string,
@@ -550,6 +758,16 @@ function HttpHashMap.GetSortedAsync(
 	})
 end
 
+--[=[
+	Gets the rank of a specific key within a sorted context.
+	
+	@param key string -- The item key to rank
+	@param dataName string -- The field to sort by
+	@param sortDirection "asc" | "desc"
+	@param defaultValue any?
+	@param cacheOptions table?
+	@return number? -- The rank (0-indexed usually) or nil if not found/error
+]=]
 function HttpHashMap.GetRankAsync(
 	self: TixHashMap,
 	key: string,
@@ -598,6 +816,14 @@ function HttpHashMap.GetRankAsync(
 	return http_response.Body.data.rank
 end
 
+--[=[
+	Updates an existing item by applying a transformation function.
+	This is a read-modify-write operation (not atomic server-side).
+	
+	@param key string
+	@param transform_function (data: any) -> any -- Function that takes old data and returns new data
+	@param expiration Expiration
+]=]
 function HttpHashMap.UpdateAsync(
 	self: TixHashMap,
 	key: string,
@@ -612,6 +838,11 @@ function HttpHashMap.UpdateAsync(
 	self:SetAsync(key, new, expiration)
 end
 
+--[=[
+	Removes a key from the memory store.
+	
+	@param key string
+]=]
 function HttpHashMap.RemoveAsync(self: TixHashMap, key: string)
 	local http_response = Http.request(self:_getPath(key), {
 		method = "DELETE",
@@ -631,6 +862,14 @@ end
 local this = {}
 local cache = { HashMap = {} }
 
+--[=[
+	Configures global settings for the TixMemory client.
+	
+	@param config table
+		- DefaultExpiration: number? -- Default TTL for items
+		- LocalCacheDefaultTTL: number? -- Default local cache duration
+		- LocalCachePruneInterval: number? -- How often to clean local cache
+]=]
 function this.Configure(config: {
 	DefaultExpiration: number?,
 	LocalCacheDefaultTTL: number?,
@@ -641,6 +880,14 @@ function this.Configure(config: {
 	if config.LocalCachePruneInterval then GlobalConfig.LocalCachePruneInterval = config.LocalCachePruneInterval end
 end
 
+--[=[
+	Gets (or creates) an HttpHashMap instance for a specific collection ID.
+	Instances are cached, so calling this with the same ID returns the same object.
+	
+	@param id string -- The collection/map ID
+	@param useDb boolean? -- Whether to use persistent storage
+	@return TixHashMap
+]=]
 function this:GetHashMap(id: string, useDb: boolean?)
 	local cacheKey = `{id}_{useDb and "db" or "mem"}`
 	if not cache.HashMap[cacheKey] then
