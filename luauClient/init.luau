@@ -1,71 +1,3 @@
---[=[
-	API Reference:
-	
-	### TixMemoryStore (Module)
-	* .Configure(config: ClientConfig) -> void
-	  > Updates global client settings like default timeouts and cache pruning intervals.
-	
-	* :GetHashMap(id: string, useDb: boolean?) -> HttpHashMap
-	  > Returns a handle to a specific memory store map. 'useDb' enables persistent storage.
-	
-	### HttpHashMap (Instance)
-	* :SetAsync(key: string, value: ValidValue, expiration: Expiration) -> void
-	  > Sets a key-value pair with a Time-To-Live (TTL).
-	
-	* :GetAsync(key: string, cacheOptions: CacheOptions?) -> any?
-	  > Retrieves a value. Optional 'cacheOptions' enables local caching.
-	
-	* :ConfigureBatching(config: BatchConfig) -> void
-	  > Sets up auto-batching parameters (enabled, max size, wait times) for QueueBatchSetAsync.
-	
-	* :QueueBatchSetAsync(key: string, value: ValidValue, expiration: Expiration) -> void
-	  > Adds an item to the background batch queue. Flushes automatically based on config.
-	
-	* :BatchSetAsync(items: {[string]: any}, expiration: Expiration) -> void
-	  > Immediately sends a batch of items to the server.
-	
-	* :BatchGetAsync(keys: {string}, cacheOptions: CacheOptions?) -> {[string]: any}
-	  > Retrieves multiple keys in a single request.
-	
-	* :AllItemsAsync() -> {{key: string, value: any}}
-	  > Fetches all items in the map (internally paginated). Use with caution on large maps.
-	
-	* :ListItemsAsync(sizePerPage: number) -> TixList (Iterator)
-	  > Returns an iterator object to page through the map's items.
-	
-	* :GetSortedAsync(dataName: string, sortDirection: "asc"|"desc", sizePerPage: number, defaultValue: any?, cacheOptions: CacheOptions?) -> TixList
-	  > Returns an iterator for items sorted by a specific field inside the value.
-	
-	* :GetRankAsync(key: string, dataName: string, sortDirection: "asc"|"desc", defaultValue: any?, cacheOptions: CacheOptions?) -> number?
-	  > Gets the numeric rank of an item in the sorted list.
-	
-	* :UpdateAsync(key: string, transform_function: (oldData: any)->newData: any, expiration: Expiration) -> void
-	  > Fetches, transforms, and then sets the data (Read-Modify-Write).
-	
-	* :RemoveAsync(key: string) -> void
-	  > Deletes a key from the store.
-	
-	### Types
-	* ValidValue = string | number | table
-	* Expiration = number (seconds) | string (e.g. "5m", "1h")
-	* CacheOptions = { id: string?, ttl: number }
-]=]
-
---[=[
-	@class TixMemoryClient
-	
-	A robust Luau client for interacting with the TixMemory service (Basic Memory Store).
-	This client handles HTTP requests, local caching, batching, and pagination for interacting
-	with the external memory store API.
-	
-	Features:
-	- Key-Value storage with expiration (TTL)
-	- In-memory local caching to reduce HTTP overhead
-	- Automatic batching for high-throughput Set operations
-	- Sorted lists and ranking capabilities
-	- Pagination for large datasets
-]=]
-
 local HttpService = game:GetService("HttpService")
 
 -- Service Dependencies
@@ -862,6 +794,226 @@ end
 local this = {}
 local cache = { HashMap = {} }
 
+-- Global Batching Logic
+local GlobalBatch = {
+	Queue = {}, -- Key: "index::key", Value: {index, key, data, useDb}
+	Count = 0,
+	TTL = nil,
+	LastFirstItemTime = 0,
+	Config = {
+		enabled = true,
+		minSize = 1,
+		maxSize = 200,
+		waitTime = 1,
+		delayPerBatch = 0,
+		forceWaitTime = 0,
+	},
+}
+
+-- Background task for Global Batch
+task.spawn(function()
+	while true do
+		task.wait(0.1)
+		if GlobalBatch.Config.enabled and GlobalBatch.Count > 0 then
+			local shouldFlush = false
+			local now = os.time()
+
+			if GlobalBatch.Count >= GlobalBatch.Config.maxSize then
+				shouldFlush = true
+			elseif GlobalBatch.Count >= GlobalBatch.Config.minSize then
+				if now - GlobalBatch.LastFirstItemTime >= GlobalBatch.Config.waitTime then
+					shouldFlush = true
+				end
+			elseif GlobalBatch.Config.forceWaitTime > 0 then
+				if now - GlobalBatch.LastFirstItemTime >= GlobalBatch.Config.forceWaitTime then
+					shouldFlush = true
+				end
+			end
+
+			if shouldFlush then
+				local queue = GlobalBatch.Queue
+				local ttl = GlobalBatch.TTL
+
+				GlobalBatch.Queue = {}
+				GlobalBatch.Count = 0
+				GlobalBatch.TTL = nil
+				GlobalBatch.LastFirstItemTime = 0
+
+				task.spawn(function()
+					-- Split into mem and db batches
+					local memItems = {}
+					local dbItems = {}
+
+					for _, item in pairs(queue) do
+						if item.useDb then
+							table.insert(dbItems, item)
+						else
+							table.insert(memItems, item)
+						end
+					end
+
+					if #memItems > 0 then
+						this:GlobalBatchSetAsync(memItems, ttl, false)
+					end
+					if #dbItems > 0 then
+						this:GlobalBatchSetAsync(dbItems, ttl, true)
+					end
+				end)
+			end
+		end
+	end
+end)
+
+--[=[
+	Configures global batching behavior.
+]=]
+function this:ConfigureGlobalBatching(config: {
+	enabled: boolean?,
+	minBatchSize: number?,
+	maxBatchSize: number?,
+	waitTime: number?,
+	delayPerBatch: number?,
+	forceWaitTime: number?
+})
+	if config.enabled ~= nil then GlobalBatch.Config.enabled = config.enabled end
+	if config.minBatchSize then GlobalBatch.Config.minSize = config.minBatchSize end
+	if config.maxBatchSize then GlobalBatch.Config.maxSize = config.maxBatchSize end
+	if config.waitTime then GlobalBatch.Config.waitTime = config.waitTime end
+	if config.delayPerBatch then GlobalBatch.Config.delayPerBatch = config.delayPerBatch end
+	if config.forceWaitTime then GlobalBatch.Config.forceWaitTime = config.forceWaitTime end
+end
+
+--[=[
+	Queues an item for the global batch.
+]=]
+function this:QueueGlobalBatchSetAsync(index: string, key: string, value: ValidValue, expiration: Expiration, useDb: boolean?)
+	local compositeKey = `{index}::{key}`
+	if not GlobalBatch.Queue[compositeKey] then
+		GlobalBatch.Count += 1
+		if GlobalBatch.Count == 1 then
+			GlobalBatch.LastFirstItemTime = os.time()
+		end
+	end
+	
+	GlobalBatch.Queue[compositeKey] = {
+		index = index,
+		key = key,
+		data = value,
+		useDb = useDb
+	}
+
+	if expiration then
+		GlobalBatch.TTL = expiration
+	end
+
+	-- Check for immediate flush
+	if GlobalBatch.Config.enabled and GlobalBatch.Count >= GlobalBatch.Config.maxSize then
+		local queue = GlobalBatch.Queue
+		local ttl = GlobalBatch.TTL
+
+		GlobalBatch.Queue = {}
+		GlobalBatch.Count = 0
+		GlobalBatch.TTL = nil
+		GlobalBatch.LastFirstItemTime = 0
+
+		task.spawn(function()
+			local memItems = {}
+			local dbItems = {}
+			for _, item in pairs(queue) do
+				if item.useDb then
+					table.insert(dbItems, item)
+				else
+					table.insert(memItems, item)
+				end
+			end
+			if #memItems > 0 then
+				this:GlobalBatchSetAsync(memItems, ttl, false)
+			end
+			if #dbItems > 0 then
+				this:GlobalBatchSetAsync(dbItems, ttl, true)
+			end
+		end)
+	end
+end
+
+--[=[
+	Executes a global batch set.
+]=]
+function this:GlobalBatchSetAsync(items: { { index: string, key: string, data: any } }, expiration: Expiration, useDb: boolean?)
+	local ttl = TimeParser.parse(expiration) or GlobalConfig.DefaultExpiration
+	local payloadItems = items
+
+	local function sendBatch(batch)
+		local path = `{BASE_URL}/batch/buffered`
+		local http_response = Http.request(path, {
+			method = "POST",
+			headers = {
+				authorization = AUTHORIZATION_KEY,
+				["content-type"] = "application/json",
+			},
+			params = {},
+			data = {
+				ttl = ttl,
+				items = batch,
+				persist = useDb,
+			},
+		})
+		if not http_response.Success then
+			error(`Failed to global batch set HttpMemoryStore: {http_response.StatusCode}`)
+		end
+	end
+
+	local chunk = {}
+	for _, item in ipairs(payloadItems) do
+		table.insert(chunk, item)
+		if #chunk >= 200 then
+			sendBatch(chunk)
+			chunk = {}
+			if GlobalBatch.Config.delayPerBatch > 0 then
+				task.wait(GlobalBatch.Config.delayPerBatch)
+			end
+		end
+	end
+	if #chunk > 0 then
+		sendBatch(chunk)
+	end
+end
+
+--[=[
+	Forcefully flushes the global batch queue.
+	Useful for game shutdown (BindToClose) to ensure data is saved.
+]=]
+function this:FlushGlobalBatchAsync()
+	if GlobalBatch.Count == 0 then return end
+
+	local queue = GlobalBatch.Queue
+	local ttl = GlobalBatch.TTL
+
+	GlobalBatch.Queue = {}
+	GlobalBatch.Count = 0
+	GlobalBatch.TTL = nil
+	GlobalBatch.LastFirstItemTime = 0
+
+	local memItems = {}
+	local dbItems = {}
+
+	for _, item in pairs(queue) do
+		if item.useDb then
+			table.insert(dbItems, item)
+		else
+			table.insert(memItems, item)
+		end
+	end
+
+	-- Run synchronously for BindToClose
+	if #memItems > 0 then
+		this:GlobalBatchSetAsync(memItems, ttl, false)
+	end
+	if #dbItems > 0 then
+		this:GlobalBatchSetAsync(dbItems, ttl, true)
+	end
+end
+
 --[=[
 	Configures global settings for the TixMemory client.
 	
@@ -895,5 +1047,20 @@ function this:GetHashMap(id: string, useDb: boolean?)
 	end
 	return cache.HashMap[cacheKey]
 end
+
+-- Automatic shutdown handling
+game:BindToClose(function()
+	-- Flush global buffered writes
+	this:FlushGlobalBatchAsync()
+	
+	-- Also flush per-instance queues if any items remain
+	for _, instance in pairs(cache.HashMap) do
+		if instance._queueCount > 0 then
+			local batch = instance._queue
+			local ttl = instance._queueTTL
+			instance:BatchSetAsync(batch, ttl)
+		end
+	end
+end)
 
 return this

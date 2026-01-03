@@ -1,7 +1,7 @@
 local Leaderboard = {}
 Leaderboard.__index = Leaderboard
 
-local MemoryStoreClient = require(script.Parent.Parent:WaitForChild("luauClient"))
+local MemoryStoreClient = require(script.Parent:WaitForChild("TixMemoryStore"))
 
 local DEFAULT_EXPIRATION = "90d"
 
@@ -25,13 +25,14 @@ function Leaderboard.new(boardId: string, useDb: boolean?, useCache: boolean?)
 	local self = setmetatable({}, Leaderboard)
 	self._store = MemoryStoreClient:GetHashMap(boardId, useDb)
 
-	-- Default batching configuration to reduce HTTP usage
-	self._store:ConfigureBatching({
+	-- Default global batching configuration to reduce HTTP usage
+	-- Note: This affects all write operations using Global Batching
+	MemoryStoreClient:ConfigureGlobalBatching({
 		enabled = true,
 		minBatchSize = 5,
-		maxBatchSize = 50,
-		waitTime = 5, -- Wait up to 5 seconds before flushing if minBatchSize is met
-		forceWaitTime = 60, -- Always flush after 60 seconds regardless of batch size
+		maxBatchSize = 500, -- Higher limit for global batch
+		waitTime = 30, -- Wait up to 30 seconds before flushing if minBatchSize is met
+		forceWaitTime = 300, -- Always flush after 5 minutes regardless of batch size
 	})
 
 	self._sortField = "Score" -- The JSON field used for ranking
@@ -48,7 +49,7 @@ function Leaderboard.ConfigureBatching(self: Leaderboard, config: {
 	delayPerBatch: number?,
 	forceWaitTime: number?
 })
-	self._store:ConfigureBatching(config)
+	MemoryStoreClient:ConfigureGlobalBatching(config)
 end
 
 -- Sets the player's score (queued for batch update)
@@ -62,7 +63,7 @@ function Leaderboard.SetScore(self: Leaderboard, player: Player, score: number, 
 	}
 
 	-- Expires in 30 days by default to keep the board fresh, or adjust as needed
-	self._store:QueueBatchSetAsync(key, data, expiration or DEFAULT_EXPIRATION)
+	MemoryStoreClient:QueueGlobalBatchSetAsync(self._store.Id, key, data, expiration or DEFAULT_EXPIRATION, self._store.UseDb)
 end
 
 -- Increments the player's existing score

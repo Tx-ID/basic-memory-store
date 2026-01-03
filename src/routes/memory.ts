@@ -7,6 +7,7 @@ import mongoose from "mongoose";
 import config from "../config/config";
 import { TTLCache } from "../utils/cache";
 import { CacheModel } from "../models/MemoryCache";
+import { dbBatcher } from "../utils/dbBatcher";
 
 // --- In-Memory Cache Setup ---
 const router = Router();
@@ -94,6 +95,16 @@ const BatchSetBody = z.object({
     persist: z.boolean().default(false),
 });
 
+const GlobalBatchSetBody = z.object({
+    ttl: z.number().int().default(2 * 60),
+    items: z.array(z.object({
+        index: z.string(),
+        key: z.string(),
+        data: z.any()
+    })).max(500),
+    persist: z.boolean().default(false),
+});
+
 const BatchGetBody = z.object({
     keys: z.array(z.string()).max(100),
     useDb: z.boolean().default(false),
@@ -116,6 +127,130 @@ function parseValue(val: string | undefined): string | number | undefined {
 }
 
 // --- Routes ---
+
+async function bufferedBatchSet(req: Request, res: Response, next: NextFunction) {
+    try {
+        const safe = GlobalBatchSetBody.safeParse(req.body);
+        if (!safe.success) {
+            return res.status(StatusCodes.BAD_REQUEST).send({
+                error: ReasonPhrases.BAD_REQUEST,
+                error_data: safe.error.issues,
+            });
+        }
+
+        const { ttl, items, persist } = safe.data;
+        
+        // Permission Check
+        const allowedIndexes: string[] = res.locals.allowedIndexes || [];
+        const isUniversal = allowedIndexes.includes("*");
+        
+        if (!isUniversal) {
+            for (const item of items) {
+                if (!allowedIndexes.includes(item.index)) {
+                     return res.status(StatusCodes.FORBIDDEN).send({
+                        error: ReasonPhrases.FORBIDDEN, 
+                        message: `Key not allowed for index: ${item.index}`
+                    });
+                }
+            }
+        }
+
+        const cursor = Date.now();
+
+        if (persist) {
+            if (!isDbReady()) {
+                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({
+                    error: ReasonPhrases.SERVICE_UNAVAILABLE,
+                    message: "Database not connected",
+                });
+            }
+
+            const expireAt = new Date(Date.now() + (ttl * 1000));
+            const operations = items.map(item => ({
+                updateOne: {
+                    filter: { index: item.index, key: item.key },
+                    update: { payload: item.data, cursor, expireAt },
+                    upsert: true
+                }
+            }));
+
+            dbBatcher.addMany(operations);
+        } else {
+            // For memory-only, we can just write immediately or use a memory batcher if needed.
+            // Since dbBatcher is for DB, we'll just write to memory directly here.
+            for (const item of items) {
+                const game = get_index_cache(item.index);
+                game.set(item.key, { payload: item.data, cursor }, ttl);
+            }
+        }
+
+        res.status(StatusCodes.OK).send({ message: ReasonPhrases.OK });
+    } catch (error) {
+        next(error);
+    }
+}
+router.post("/batch/buffered", bufferedBatchSet);
+
+async function globalBatchSet(req: Request, res: Response, next: NextFunction) {
+    try {
+        const safe = GlobalBatchSetBody.safeParse(req.body);
+        if (!safe.success) {
+            return res.status(StatusCodes.BAD_REQUEST).send({
+                error: ReasonPhrases.BAD_REQUEST,
+                error_data: safe.error.issues,
+            });
+        }
+
+        const { ttl, items, persist } = safe.data;
+        
+        // Permission Check
+        const allowedIndexes: string[] = res.locals.allowedIndexes || [];
+        const isUniversal = allowedIndexes.includes("*");
+        
+        if (!isUniversal) {
+            for (const item of items) {
+                if (!allowedIndexes.includes(item.index)) {
+                     return res.status(StatusCodes.FORBIDDEN).send({
+                        error: ReasonPhrases.FORBIDDEN, 
+                        message: `Key not allowed for index: ${item.index}`
+                    });
+                }
+            }
+        }
+
+        const cursor = Date.now();
+
+        if (persist) {
+            if (!isDbReady()) {
+                return res.status(StatusCodes.SERVICE_UNAVAILABLE).send({
+                    error: ReasonPhrases.SERVICE_UNAVAILABLE,
+                    message: "Database not connected",
+                });
+            }
+
+            const expireAt = new Date(Date.now() + (ttl * 1000));
+            const operations = items.map(item => ({
+                updateOne: {
+                    filter: { index: item.index, key: item.key },
+                    update: { payload: item.data, cursor, expireAt },
+                    upsert: true
+                }
+            }));
+
+            await CacheModel.bulkWrite(operations);
+        } else {
+            for (const item of items) {
+                const game = get_index_cache(item.index);
+                game.set(item.key, { payload: item.data, cursor }, ttl);
+            }
+        }
+
+        res.status(StatusCodes.OK).send({ message: ReasonPhrases.OK });
+    } catch (error) {
+        next(error);
+    }
+}
+router.post("/batch/set", globalBatchSet);
 
 async function batchSet(req: Request, res: Response, next: NextFunction) {
     try {

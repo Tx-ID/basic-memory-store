@@ -29,6 +29,14 @@ export const keyHandler = async (
                  return res.status(StatusCodes.UNAUTHORIZED).send({error: ReasonPhrases.UNAUTHORIZED});
             }
 
+            // Store allowed indexes for route handlers to use
+            res.locals.allowedIndexes = apiKeyDoc.allowedIndexes;
+
+            // Special case: Global Batch endpoint checks permissions per-item in the handler
+            if (req.path === "/batch/set" || req.path === "/batch/buffered") {
+                return next();
+            }
+
             // Extract index from path: /:index/...
             // req.path always starts with /
             const segments = req.path.split("/");
@@ -58,6 +66,7 @@ export const keyHandler = async (
 
     // Fallback if DB is not connected (e.g. init phase or failure)
     if (config.keys.includes(token)) {
+        res.locals.allowedIndexes = ["*"];
         return next();
     }
 
