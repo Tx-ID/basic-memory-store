@@ -145,8 +145,9 @@ async function bufferedBatchSet(req: Request, res: Response, next: NextFunction)
         const isUniversal = allowedIndexes.includes("*");
         
         if (!isUniversal) {
+            const allowedSet = new Set(allowedIndexes);
             for (const item of items) {
-                if (!allowedIndexes.includes(item.index)) {
+                if (!allowedSet.has(item.index)) {
                      return res.status(StatusCodes.FORBIDDEN).send({
                         error: ReasonPhrases.FORBIDDEN, 
                         message: `Key not allowed for index: ${item.index}`
@@ -208,8 +209,9 @@ async function globalBatchSet(req: Request, res: Response, next: NextFunction) {
         const isUniversal = allowedIndexes.includes("*");
         
         if (!isUniversal) {
+            const allowedSet = new Set(allowedIndexes);
             for (const item of items) {
-                if (!allowedIndexes.includes(item.index)) {
+                if (!allowedSet.has(item.index)) {
                      return res.status(StatusCodes.FORBIDDEN).send({
                         error: ReasonPhrases.FORBIDDEN, 
                         message: `Key not allowed for index: ${item.index}`
@@ -237,7 +239,7 @@ async function globalBatchSet(req: Request, res: Response, next: NextFunction) {
                 }
             }));
 
-            await CacheModel.bulkWrite(operations);
+            dbBatcher.addMany(operations);
         } else {
             for (const item of items) {
                 const game = get_index_cache(item.index);
@@ -284,7 +286,7 @@ async function batchSet(req: Request, res: Response, next: NextFunction) {
                 }
             }));
 
-            await CacheModel.bulkWrite(operations);
+            dbBatcher.addMany(operations);
         } else {
             const game = get_index_cache(index);
             for (const item of items) {
@@ -370,11 +372,14 @@ async function set(req: Request, res: Response, next: NextFunction) {
             }
 
             const expireAt = new Date(Date.now() + (ttl * 1000));
-            await CacheModel.findOneAndUpdate(
-                { index, key },
-                { payload: data, cursor, expireAt },
-                { upsert: true, new: true },
-            );
+            
+            dbBatcher.add({
+                updateOne: {
+                    filter: { index, key },
+                    update: { payload: data, cursor, expireAt },
+                    upsert: true
+                }
+            });
         } else {
             get_index_cache(index).set(key, { payload: data, cursor }, ttl);
         }

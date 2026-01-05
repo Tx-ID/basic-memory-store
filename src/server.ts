@@ -8,11 +8,13 @@ import memoryRoutes from './routes/memory';
 const app = express();
 
 
-//
+// Authentication first (Fastest check)
+app.use(keyHandler);
+
+// Then payload checks and parsing
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(checkPayloadSize);
-app.use(keyHandler);
 
 
 // routes here

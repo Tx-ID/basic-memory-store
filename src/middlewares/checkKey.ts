@@ -5,6 +5,10 @@ import mongoose from "mongoose";
 import config from "../config/config";
 import { ApiKeyModel } from "../models/ApiKey";
 
+// Simple in-memory cache for API keys
+const authCache = new Map<string, { allowedIndexes: string[], expiry: number }>();
+const CACHE_TTL = 60 * 1000; // 1 minute
+
 export const keyHandler = async (
     req: Request,
     res: Response,
@@ -20,55 +24,64 @@ export const keyHandler = async (
         return res.status(StatusCodes.UNAUTHORIZED).send({error: ReasonPhrases.UNAUTHORIZED});
     }
 
-    // If Database is connected, use it for Auth source of truth
-    if (mongoose.connection.readyState === 1) {
-        try {
-            const apiKeyDoc = await ApiKeyModel.findOne({ key: token, active: true });
-            
-            if (!apiKeyDoc) {
-                 return res.status(StatusCodes.UNAUTHORIZED).send({error: ReasonPhrases.UNAUTHORIZED});
-            }
-
-            // Store allowed indexes for route handlers to use
-            res.locals.allowedIndexes = apiKeyDoc.allowedIndexes;
-
-            // Special case: Global Batch endpoint checks permissions per-item in the handler
-            if (req.path === "/batch/set" || req.path === "/batch/buffered") {
-                return next();
-            }
-
-            // Extract index from path: /:index/...
-            // req.path always starts with /
-            const segments = req.path.split("/");
-            // segments[0] is "", segments[1] is the index
-            const targetIndex = segments[1];
-
-            // If targetIndex exists (it might be empty if root path /), check permissions
-            if (targetIndex) {
-                const isUniversal = apiKeyDoc.allowedIndexes.includes("*");
-                const isAllowed = apiKeyDoc.allowedIndexes.includes(targetIndex);
-
-                if (!isUniversal && !isAllowed) {
-                     return res.status(StatusCodes.FORBIDDEN).send({
-                        error: ReasonPhrases.FORBIDDEN, 
-                        message: `Key not allowed for index: ${targetIndex}`
-                    });
+    // Check Cache first
+    const cached = authCache.get(token);
+    if (cached && cached.expiry > Date.now()) {
+        res.locals.allowedIndexes = cached.allowedIndexes;
+    } else {
+        // If Database is connected, use it for Auth source of truth
+        if (mongoose.connection.readyState === 1) {
+            try {
+                const apiKeyDoc = await ApiKeyModel.findOne({ key: token, active: true }).lean();
+                
+                if (!apiKeyDoc) {
+                     return res.status(StatusCodes.UNAUTHORIZED).send({error: ReasonPhrases.UNAUTHORIZED});
                 }
-            }
-            
-            return next();
 
-        } catch (error) {
-            console.error("Auth Error:", error);
-            return res.status(StatusCodes.INTERNAL_SERVER_ERROR).send({error: ReasonPhrases.INTERNAL_SERVER_ERROR});
+                // Cache the result
+                authCache.set(token, {
+                    allowedIndexes: apiKeyDoc.allowedIndexes,
+                    expiry: Date.now() + CACHE_TTL
+                });
+
+                res.locals.allowedIndexes = apiKeyDoc.allowedIndexes;
+            } catch (error) {
+                console.error("Auth Error:", error);
+                return res.status(StatusCodes.INTERNAL_SERVER_ERROR).send({error: ReasonPhrases.INTERNAL_SERVER_ERROR});
+            }
+        } else {
+            // Fallback if DB is not connected (e.g. init phase or failure)
+            if (config.keys.includes(token)) {
+                res.locals.allowedIndexes = ["*"];
+            } else {
+                return res.status(StatusCodes.UNAUTHORIZED).send({error: ReasonPhrases.UNAUTHORIZED});
+            }
         }
     }
 
-    // Fallback if DB is not connected (e.g. init phase or failure)
-    if (config.keys.includes(token)) {
-        res.locals.allowedIndexes = ["*"];
+    // Permissions check logic (using res.locals.allowedIndexes)
+    const allowedIndexes = res.locals.allowedIndexes;
+    const isUniversal = allowedIndexes.includes("*");
+
+    // Special case: Global Batch endpoint checks permissions per-item in the handler
+    if (req.path === "/batch/set" || req.path === "/batch/buffered") {
         return next();
     }
 
-    return res.status(StatusCodes.UNAUTHORIZED).send({error: ReasonPhrases.UNAUTHORIZED});
+    // Extract index from path: /:index/...
+    const segments = req.path.split("/");
+    const targetIndex = segments[1];
+
+    if (targetIndex && !["batch", "sorted", "rank"].includes(targetIndex)) {
+        const isAllowed = allowedIndexes.includes(targetIndex);
+
+        if (!isUniversal && !isAllowed) {
+             return res.status(StatusCodes.FORBIDDEN).send({
+                error: ReasonPhrases.FORBIDDEN, 
+                message: `Key not allowed for index: ${targetIndex}`
+            });
+        }
+    }
+    
+    return next();
 };

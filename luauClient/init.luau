@@ -800,6 +800,7 @@ local GlobalBatch = {
 	Count = 0,
 	TTL = nil,
 	LastFirstItemTime = 0,
+	CurrentJitter = 0, -- Store jitter for the current batch
 	Config = {
 		enabled = true,
 		minSize = 1,
@@ -812,6 +813,8 @@ local GlobalBatch = {
 
 -- Background task for Global Batch
 task.spawn(function()
+	GlobalBatch.CurrentJitter = math.random() * 2.0 -- Initial jitter (0-2s)
+	
 	while true do
 		task.wait(0.1)
 		if GlobalBatch.Config.enabled and GlobalBatch.Count > 0 then
@@ -821,7 +824,8 @@ task.spawn(function()
 			if GlobalBatch.Count >= GlobalBatch.Config.maxSize then
 				shouldFlush = true
 			elseif GlobalBatch.Count >= GlobalBatch.Config.minSize then
-				if now - GlobalBatch.LastFirstItemTime >= GlobalBatch.Config.waitTime then
+				-- Add jitter to waitTime to desynchronize servers
+				if now - GlobalBatch.LastFirstItemTime >= (GlobalBatch.Config.waitTime + GlobalBatch.CurrentJitter) then
 					shouldFlush = true
 				end
 			elseif GlobalBatch.Config.forceWaitTime > 0 then
@@ -838,6 +842,7 @@ task.spawn(function()
 				GlobalBatch.Count = 0
 				GlobalBatch.TTL = nil
 				GlobalBatch.LastFirstItemTime = 0
+				GlobalBatch.CurrentJitter = math.random() * 2.0 -- Reset jitter for next batch
 
 				task.spawn(function()
 					-- Split into mem and db batches
@@ -892,6 +897,9 @@ function this:QueueGlobalBatchSetAsync(index: string, key: string, value: ValidV
 		GlobalBatch.Count += 1
 		if GlobalBatch.Count == 1 then
 			GlobalBatch.LastFirstItemTime = os.time()
+			if GlobalBatch.CurrentJitter == 0 then
+				GlobalBatch.CurrentJitter = math.random() * 2.0
+			end
 		end
 	end
 	
